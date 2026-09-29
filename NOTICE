@@ -1,0 +1,14 @@
+qwen38-flashnext-nvfp4-kv
+Copyright 2026 Lesilva
+
+This repository contains modified copies of source files from:
+
+  SGLang (https://github.com/sgl-project/sglang)
+  Copyright SGLang contributors, licensed under the Apache License 2.0.
+
+  Pennyroyal / sglang-rtxpro6000 (https://github.com/jpezzulli/sglang-rtxpro6000)
+  Copyright its contributors, licensed under the Apache License 2.0.
+
+Files under overlay/ are complete copies of Pennyroyal 2.5.3 sources with the
+changes shown in patches/. python/sglang/srt/layers/attention/qsa/nvfp4_kv.py
+and tests/test_nvfp4_kv.py are new files in this repository.

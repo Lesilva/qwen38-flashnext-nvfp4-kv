@@ -1,0 +1,34 @@
+diff -ruN a/python/sglang/srt/mem_cache/kv_cache_configurator.py b/python/sglang/srt/mem_cache/kv_cache_configurator.py
+--- a/python/sglang/srt/mem_cache/kv_cache_configurator.py	2026-09-28 22:01:51
++++ b/python/sglang/srt/mem_cache/kv_cache_configurator.py	2026-09-28 22:01:51
+@@ -2154,8 +2154,29 @@
+                     get_schedule().max_running_requests // self.ps.attn_dp_size,
+                     get_schedule().max_mamba_cache_size // ratio,
+                 )
++                intermediate_per_req = stage_per_req
++                # Local RecoverSSM accounting fix, pinned to Pennyroyal v2.5.1.
++                # MambaPool omits intermediate_ssm in none mode, but still
++                # allocates conv windows. Charge their dense upper bound (the
++                # CUDA linear-chain layout may deduplicate it further).
++                if (
++                    self.hybrid_gdn_config is not None
++                    and get_exec().mamba.gdn_mtp_cache_mode == "none"
++                ):
++                    params = config.mamba2_cache_params
++                    intermediate_per_req = int(
++                        sum(math.prod(shape) for shape in params.shape.conv)
++                        * params.dtype.conv.itemsize
++                        * len(params.layers)
++                        * pp_layer_scale
++                    )
++                    logger.info(
++                        "RecoverSSM none-mode budget: reserving dense conv "
++                        "windows only (%.2f MiB per slot), no intermediate SSM.",
++                        intermediate_per_req / (1 << 20),
++                    )
+                 intermediate_size = (
+-                    stage_per_req
++                    intermediate_per_req
+                     * (capped_reqs + 1)
+                     * get_spec().speculative_num_draft_tokens
+                 )

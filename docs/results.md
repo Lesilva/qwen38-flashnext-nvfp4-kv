@@ -77,3 +77,22 @@ We compared 2.5.3 with the patches against 2.5.2 with the patches, both NVFP4 wi
 | Paired NLL vs 2.5.2 (8K / 32K / 128K) | −0.000 ± 0.013 / +0.016 ± 0.039 / +0.003 ± 0.046 |
 | 490K retrieval / stress 768 requests | pass / 0 errors |
 | Minimum free VRAM during the suite | 1987 MiB |
+
+## 6. Pennyroyal 3.0.1 rebase (production since 2026-10-12)
+
+The `qwen_sparse_attn_backend.py` merge had one conflict, a trivial init block. The RecoverSSM budget set was retired, since 3.0 ships the upstream fix. The configuration matches the production setup above, plus `FLASHINFER_GDN_FP16_ACCUM_MMA=1`, which 3.0's own launcher sets by default.
+
+| Metric | 2.5.3 (prev. prod) | **3.0.1, fixed MTP (A, now prod)** | 3.0.1, adaptive MTP (B) |
+|---|---:|---:|---:|
+| Unit tests T1–T5 (FlashInfer 0.7.0.post1) | pass | pass | — |
+| Functional / Responses / stress / concurrency | pass | pass | pass |
+| Decode throughput vs 2.5.3, 24-case geomean | 1.000 | **1.056** (C1 +13–16%, C2 +13–18%, C4 +8%, C8+ ±3%) | — |
+| C1 vs A, geomean | — | 1.000 | 0.970 |
+| C1 decode, tok/s (zh / en / code / tool) | — | 227 / 222 / 248 / 236 | 221 / 207 / 254 / 226 |
+| Cold prefill 8K / 32K / 128K / 240K | 11.1 / 11.1 / 10.6 / 9.7 K tok/s | 12.5 / 12.6 / 11.9 / 10.9 K | 11.6 / 12.6 / 11.9 / 10.8 K |
+| 490K three-needle TTFT | 71.1 s | 66.5 s | 66.6 s |
+| 480K main-agent TTFT / longest subagent stall | 79.0 s / 0.51 s | 74.8 s / 0.50 s | 75.0 s / 1.33 s |
+| Paired NLL vs 2.5.3 (8K / 32K / 128K) | — | −0.008±0.024 / −0.041±0.054 / −0.014±0.030 | (vs A) −0.006±0.009 / −0.020±0.024 / −0.007±0.045 |
+| Minimum free VRAM during the suite | 1987 MiB | **2749 MiB** | 1885 MiB |
+
+All NLL intervals include 0. Adaptive MTP raised C1 acceptance from 2.62 to 2.72, but verifying 8 tokens per step cost more than that gained on our prose, tool and Chinese workloads. Only code was faster, by 2.4%.

@@ -19,10 +19,12 @@ Full numbers: [docs/results.md](docs/results.md). How it works: [docs/design.md]
 
 ## Status
 
-- Validated on **Pennyroyal 2.5.3** (`ghcr.io/jpezzulli/sglang-rtxpro6000@sha256:81d4d3d1…`, SGLang 0.5.19). The same code ran in production on Pennyroyal 2.5.2 before that.
+- **Pennyroyal 3.0.1** (`ghcr.io/jpezzulli/sglang-rtxpro6000@sha256:25400f56…`): in production since 2026-10-12, full suite passed. Relative to our 2.5.3 deployment, it is +5.6% decode (geomean; +13–18% at 1–2 streams) and +12–13% cold prefill.
+- **Pennyroyal 2.5.3** (`…@sha256:81d4d3d1…`): validated and ran in production 09-28 → 10-12. Earlier, the same code ran on 2.5.2.
+- Both releases are on the SGLang 0.5.19 integration base.
 - Hardware: **1× RTX PRO 6000 Blackwell 96 GB (SM120)**, 350 W cap. Other SM100/SM120 GPUs should work but are untested.
 - Checkpoint used: `jpezzulli/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4` (NVFP4 weights). Any Qwen3.8 Flash-Next checkpoint that Pennyroyal serves through its QSA backend should work; others are untested.
-- Not upstream. Upstream SGLang has no QSA NVFP4 KV path yet (as of 2026-09-28). vLLM has an open PR for Qwen4Exp (#54846).
+- Not upstream. Upstream SGLang has no QSA NVFP4 KV path yet (as of 2026-10-12). vLLM has an open PR for Qwen4Exp (#54846). See [Related work](#related-work) for community implementations.
 
 ## What's in here
 
@@ -30,11 +32,13 @@ Full numbers: [docs/results.md](docs/results.md). How it works: [docs/design.md]
 |---|---|---|---|
 | `nvfp4-kv` | **required** | `qsa/nvfp4_kv.py` (new), `qwen_sparse_attn_backend.py`, `fp4_kv_cache_quant_method.py`, `kv_cache_configurator.py`, `flashinfer_backend.py`, `server_args.py` | Stores the QSA layers' KV as NVFP4 (packed E2M1 + one E4M3 scale per 16 values). QSA's own top-k and prefix gathers dequantize to FP8 on the fly, so the attention kernels are unchanged and no full-pool dequant workspace is allocated. |
 | `optional-mamba-pingpong-fix` | optional, recommended with `--prefill-decode-interval` | `managers/scheduler.py`, `mem_cache/unified_radix_cache.py` | Fixes a scheduler crash (`Not enough space for mamba ping pong` / `Can not alloc mamba cache`) under mixed long/short agent load. (A) releases the COW-source lock on the early-return path of `cache_unfinished_req`. This part only takes effect with `SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=true`. (B) adds a Mamba-slot admission check before batching. Upstream: sgl-project/sglang#34676, #39787. |
-| `optional-recoverssm-budget` | optional, needed for `--gdn-mtp-cache-mode none` | `mem_cache/kv_cache_configurator.py` | Correct memory budgeting for conv windows in RecoverSSM none mode. This file also contains the `nvfp4-kv` change and replaces that set's copy. |
+| `optional-recoverssm-budget` | **2.5.3 only**, needed there for `--gdn-mtp-cache-mode none` | `mem_cache/kv_cache_configurator.py` | Correct memory budgeting for conv windows in RecoverSSM none mode. This file also contains the `nvfp4-kv` change and replaces that set's copy. Pennyroyal 3.0 ships an upstream fix (Penny #51), so 3.0.1 has no such set. |
 
 Each set comes in two forms:
-- `overlay/pennyroyal-2.5.3/<set>/python/...`: complete replacement files, for bind mounts or `COPY`.
-- `patches/pennyroyal-2.5.3/000N-*.patch`: unified diffs against the Pennyroyal 2.5.3 source root. Apply with `git apply` or `patch -p1`, in order 0001 → 0002 → 0003. 0001 and 0002 also apply on their own.
+- `overlay/pennyroyal-<ver>/<set>/python/...`: complete replacement files, for bind mounts or `COPY`.
+- `patches/pennyroyal-<ver>/000N-*.patch`: unified diffs against that release's source root. Apply with `git apply` or `patch -p1` in numeric order; 0001 and 0002 also apply on their own.
+
+Available versions: `pennyroyal-3.0.1` (0001, 0002) and `pennyroyal-2.5.3` (0001, 0002, 0003).
 
 ## Quick start
 
@@ -43,14 +47,15 @@ Each set comes in two forms:
 ```bash
 git clone https://github.com/Lesilva/qwen38-flashnext-nvfp4-kv
 cd qwen38-flashnext-nvfp4-kv
-docker build -t qwen38-nvfp4-kv:2.5.3 .
+docker build -t qwen38-nvfp4-kv:3.0.1 .      # see the Dockerfile header for 2.5.3
 MODEL_DIR=/path/to/checkpoint ./examples/run-tested-config.sh
 ```
 
-**B. No build: bind-mount the overlay** into the stock Pennyroyal 2.5.3 image:
+**B. No build: bind-mount the overlay** into the stock Pennyroyal image of the same version (run it as `--user 0:0` or adjust ownership; 3.0 images default to user `penny`):
 
 ```bash
-./examples/overlay-mounts.sh --with-pingpong-fix --with-recoverssm-budget
+./examples/overlay-mounts.sh --with-pingpong-fix                                   # 3.0.1
+./examples/overlay-mounts.sh --penny 2.5.3 --with-pingpong-fix --with-recoverssm-budget
 # paste the printed -v/-e lines into your docker run
 ```
 
@@ -73,7 +78,7 @@ Run the unit tests on the GPU; they take about a minute:
 ```bash
 docker run --rm --gpus device=0 --entrypoint /opt/pennyroyal/.venv/bin/python \
   -e PYTHONPATH=/opt/pennyroyal/python -v "$PWD/tests:/tests" \
-  qwen38-nvfp4-kv:2.5.3 /tests/test_nvfp4_kv.py /tmp/nvfp4-unit.json
+  qwen38-nvfp4-kv:3.0.1 /tests/test_nvfp4_kv.py /tmp/nvfp4-unit.json
 ```
 
 What the tests check:
@@ -86,12 +91,23 @@ Server log at startup should include `KV4: QSA NVFP4 KV enabled via SGLANG_QSA_N
 
 ## Limitations
 
-- Served and benchmarked with **all three sets together**. The sets touch independent code paths, but `nvfp4-kv` alone has not been run as a server yet.
-- Pinned to Pennyroyal 2.5.3. The overlay files replace whole source files, so do not mount them into another version. Rebased sets will be added per release as `overlay/pennyroyal-<ver>/`.
+- Served and benchmarked with **all sets for that version together**. The sets touch independent code paths, but `nvfp4-kv` alone has not been run as a server yet.
+- Pinned per release. The overlay files replace whole source files, so only mount them into the matching Pennyroyal version. Rebased sets are added per release as `overlay/pennyroyal-<ver>/`.
 - Capacity planning is not fixed (see `--max-total-tokens` above).
 - NVFP4 is storage-only. Attention still runs on an FP8 scratch buffer (`SGLANG_QSA_NVFP4_SCRATCH=bf16` switches it to BF16; we measured no quality difference).
 - Checkpoint KV scales are not loaded (global scale = 1.0, same as the stock FP8 path).
-- Tested with `--mamba-radix-cache-strategy extra_buffer_lazy`, MTP 3 steps, page size 64. Other combinations are untested.
+- Tested with `--mamba-radix-cache-strategy extra_buffer_lazy`, MTP 3 steps, page size 64. On 3.0.1 we also served 3.0's adaptive MTP (4/8-token width at C1) with this patch set: it passed the full suite, but on our workload it was 3% slower at C1 than fixed MTP and used 0.86 GiB more VRAM, so production stays on fixed MTP. Other combinations are untested.
+
+## Related work
+
+We wrote this independently. Afterwards we found the same core idea (dequantize NVFP4 inside QSA's gather, with no full-pool workspace) already public in SGLang-based stacks:
+- [Olyno/Qwen3.8-Flash-Next-Dual-DGX-Sparks](https://github.com/Olyno/Qwen3.8-Flash-Next-Dual-DGX-Sparks) ("dspark", MiaAI Lab): the original SGLang patch, on 2× DGX Spark (SM121).
+- [redashes1984/sglang-flashnext-nvfp4kv-sm120](https://github.com/redashes1984/sglang-flashnext-nvfp4kv-sm120): a port of the dspark patch to the RTX PRO 6000, plus an expert cold pool and a 1M-context deployment.
+
+Differences here:
+- We dequantize into an **FP8** scratch, so the stock FP8 XQA decode kernel is reused and the gather is faster than the plain FP8 copy. Those projects dequantize to BF16.
+- We ship bit-exact kernel tests against FlashInfer and a paired 24-window NLL measurement.
+- We provide overlays rebased onto each Pennyroyal release.
 
 ## License
 
@@ -112,7 +128,7 @@ Apache-2.0, same as SGLang and Pennyroyal. The overlay files are modified copies
 **内容**：
 - 必需：`nvfp4-kv`。
 - 可选：`optional-mamba-pingpong-fix`，修复长短 agent 混跑时调度器因 Mamba 状态槽耗尽而崩溃的问题。开 `--prefill-decode-interval` 时建议装。
-- 可选：`optional-recoverssm-budget`，修正 `--gdn-mtp-cache-mode none` 下的显存预算。
+- 可选（仅 2.5.3）：`optional-recoverssm-budget`，修正 `--gdn-mtp-cache-mode none` 下的显存预算。Pennyroyal 3.0 已自带上游修复，不再需要。
 
 每组都提供两种形式：完整文件（overlay，挂载或 COPY 即可）和 diff 补丁（patches，可以 `git apply`）。
 
@@ -128,7 +144,9 @@ Apache-2.0, same as SGLang and Pennyroyal. The overlay files are modified copies
 **注意**：
 - 完整的服务测试是在三组补丁一起装的情况下做的；只装 `nvfp4-kv` 的组合还没有单独起服务测过。
 - `--max-total-tokens` 必须手动指定，因为容量规划还没有修正。
-- 只在 Pennyroyal 2.5.3（此前在 2.5.2 上跑过生产）和 RTX PRO 6000 上验证过。
+- 已在 Pennyroyal **3.0.1**（10-12 起用于生产）和 2.5.3 上验证过（更早也在 2.5.2 上跑过生产），硬件是 RTX PRO 6000。3.0.1 相对 2.5.3：解码快约 5.6%，冷 prefill 快 12～13%。
+- 3.0 的自适应 MTP 和本补丁可以一起用，但在我们的负载下单路慢 3%，所以生产仍用固定 3 步。
+- 社区里已有思路相同的实现（dspark、redashes1984），见上方 Related work。
 - overlay 是整文件替换，不要挂到其他版本上。
 
 完整测试数据见 [docs/results.md](docs/results.md)。

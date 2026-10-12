@@ -1,17 +1,24 @@
 #!/usr/bin/env bash
 # Print read-only `-v` mounts for the overlay, to paste into your own `docker run`
-# on top of the stock Pennyroyal 2.5.3 image (no image build needed). Usage:
-#   ./examples/overlay-mounts.sh [--with-pingpong-fix] [--with-recoverssm-budget]
+# on top of the stock Pennyroyal image of the same version (no image build needed). Usage:
+#   ./examples/overlay-mounts.sh [--penny 3.0.1|2.5.3] [--with-pingpong-fix] [--with-recoverssm-budget]
+# --with-recoverssm-budget exists for 2.5.3 only; 3.0 ships the upstream fix.
 set -euo pipefail
-ROOT="$(cd "$(dirname "$0")/.." && pwd)/overlay/pennyroyal-2.5.3"
-PINGPONG=0; BUDGET=0
-for arg in "$@"; do
-  case "$arg" in
+PENNY=3.0.1; PINGPONG=0; BUDGET=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --penny) PENNY="$2"; shift ;;
     --with-pingpong-fix) PINGPONG=1 ;;
     --with-recoverssm-budget) BUDGET=1 ;;
-    *) echo "unknown option: $arg" >&2; exit 2 ;;
+    *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
+  shift
 done
+ROOT="$(cd "$(dirname "$0")/.." && pwd)/overlay/pennyroyal-$PENNY"
+[ -d "$ROOT" ] || { echo "no overlay for Pennyroyal $PENNY" >&2; exit 2; }
+if [ "$BUDGET" = 1 ] && [ ! -d "$ROOT/optional-recoverssm-budget" ]; then
+  echo "optional-recoverssm-budget is not needed (and not shipped) for Pennyroyal $PENNY" >&2; exit 2
+fi
 emit() {  # emit <set>: one mount per file in that set
   find "$ROOT/$1" -type f -name '*.py' | sort | while IFS= read -r f; do
     rel="${f#"$ROOT/$1/"}"

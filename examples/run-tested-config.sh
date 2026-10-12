@@ -1,21 +1,22 @@
 #!/usr/bin/env bash
-# The exact serving configuration this patch set was validated with
-# (1x RTX PRO 6000 Blackwell 96 GB, 350 W, 89 GiB host RAM).
+# The exact serving configuration this patch set runs in production with
+# (Pennyroyal 3.0.1, 1x RTX PRO 6000 Blackwell 96 GB, 350 W, 89 GiB host RAM).
 # Adjust MODEL_DIR and anything marked "checkpoint-specific" for your setup.
 set -euo pipefail
-IMAGE="${IMAGE:-qwen38-nvfp4-kv:2.5.3}"      # built from ../Dockerfile
+IMAGE="${IMAGE:-qwen38-nvfp4-kv:3.0.1}"      # built from ../Dockerfile
 MODEL_DIR="${MODEL_DIR:?set MODEL_DIR to the checkpoint directory}"
 PORT="${PORT:-30000}"
 
 docker run -d --name qwen38-nvfp4-kv \
   --gpus device=0 --network host --ipc host --ulimit memlock=-1:-1 \
-  --memory 78g \
+  --memory 78g --user 0:0 \
   -e SGLANG_QSA_NVFP4_KV=1 \
   -e SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=true \
   -e SGLANG_MAMBA_CONV_DTYPE=bfloat16 \
   -e SGLANG_SM120_ONLINE_MXFP8=true \
   -e SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  -e FLASHINFER_GDN_FP16_ACCUM_MMA=1 \
   -v "$MODEL_DIR":/models/nvfp4:ro \
   --entrypoint /opt/pennyroyal/.venv/bin/python \
   "$IMAGE" -m sglang.launch_server \
@@ -48,6 +49,9 @@ docker run -d --name qwen38-nvfp4-kv \
 #   other checkpoints and raise it while watching nvidia-smi.
 # - --prefill-decode-interval 1 keeps other streams decoding during long prefills;
 #   use it together with the optional ping-pong fix.
-# - --gdn-mtp-cache-mode none needs the optional RecoverSSM budget fix.
+# - --gdn-mtp-cache-mode none: on 2.5.3 add the optional RecoverSSM budget fix; 3.0 ships it.
+# - Fixed MTP (3 steps / 4 draft tokens) measured faster on our workload than 3.0's adaptive MTP
+#   (C1 -3%, -0.86 GiB headroom). Try --speculative-num-steps 7 --speculative-num-draft-tokens 8
+#   --speculative-adaptive --speculative-adaptive-config <adaptive-next.json> for code-rewrite-heavy use.
 # - --ple-offload-embedding, --quantization modelopt_fp4, the online MXFP8 flag and the
 #   YaRN override are checkpoint-/goal-specific (we serve 512K via YaRN x2).

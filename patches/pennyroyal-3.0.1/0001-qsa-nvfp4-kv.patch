@@ -1,0 +1,551 @@
+diff -ruN a/python/sglang/srt/layers/attention/flashinfer_backend.py b/python/sglang/srt/layers/attention/flashinfer_backend.py
+--- a/python/sglang/srt/layers/attention/flashinfer_backend.py	2026-10-12 10:59:18
++++ b/python/sglang/srt/layers/attention/flashinfer_backend.py	2026-10-12 10:59:18
+@@ -321,6 +321,22 @@
+         self.is_dllm_model = self.dllm_config is not None
+ 
+         self.kv_cache_quant_method = self.token_to_kv_pool.get_kv_cache_quant_method()
++        # Local (QSA NVFP4 KV): for QSA models attn_backend_wrapper builds this
++        # backend and then replaces it with QwenSparseAttnBackend, so it never
++        # reads the cache. Present the pool as unquantized so construction does
++        # not demand NVFP4 flashinfer accesses or the dequant workspace QSA drops.
++        qsa_nvfp4_placeholder = os.environ.get(
++            "SGLANG_QSA_NVFP4_KV"
++        ) == "1" and getattr(self.kv_cache_quant_method, "name", None) == "nvfp4"
++        if qsa_nvfp4_placeholder:
++            from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
++
++            assert is_qwen_qsa(model_runner.model_config.hf_config)
++            from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
++                UnquantizedKVCacheMethod,
++            )
++
++            self.kv_cache_quant_method = UnquantizedKVCacheMethod()
+         self.prefill_kv_access = self.kv_cache_quant_method.resolve_attention_access(
+             "prefill", "flashinfer"
+         )
+@@ -361,6 +377,8 @@
+             )
+             else model_runner.kv_cache_dtype
+         )
++        if qsa_nvfp4_placeholder:
++            self.flashinfer_kv_cache_dtype = torch.float8_e4m3fn
+ 
+         # Parse constants
+         self.decode_use_tensor_cores = should_use_tensor_core(
+diff -ruN a/python/sglang/srt/layers/attention/qsa/nvfp4_kv.py b/python/sglang/srt/layers/attention/qsa/nvfp4_kv.py
+--- a/python/sglang/srt/layers/attention/qsa/nvfp4_kv.py	1969-12-31 19:00:00
++++ b/python/sglang/srt/layers/attention/qsa/nvfp4_kv.py	2026-10-12 10:59:18
+@@ -0,0 +1,201 @@
++"""NVFP4 KV reads for QSA (local extension).
++
++The NVFP4 recipe stores each full-attention layer as packed E2M1 pairs
++``[slots, heads, dim/2]`` (even element in the low nibble) plus one linear E4M3
++block scale per 16 elements ``[slots, heads, dim/16]``; a value is
++``e2m1 * block_scale * global_scale`` (flashinfer ``nvfp4_kv_quantize``).
++
++QSA never reads the pool directly: decode/verify/draft gather the selected
++top-k rows into a scratch, and prefix chunk-prefill gathers the whole context
++into a packed tensor.  These kernels do the same gathers but dequantize on the
++way, so the scratch keeps its FP8 (or BF16) dtype and every downstream kernel
++is unchanged -- no per-pool dequant workspace is needed.
++"""
++
++from __future__ import annotations
++
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _e2m1_to_f32(nib):
++    # nib: 4-bit code, bit 3 = sign, bits 2..1 = exponent, bit 0 = mantissa.
++    # Magnitudes 0,.5,1,1.5,2,3,4,6 as exact piecewise-linear fp32 math
++    # (tl.exp2 may lower to ex2.approx and miss the last bit).
++    m = (nib & 7).to(tl.float32)
++    val = tl.where(m < 4.0, 0.5 * m, tl.where(m < 6.0, m - 2.0, 2.0 * m - 8.0))
++    return tl.where((nib & 8) != 0, -val, val)
++
++
++@triton.jit
++def _dequant_rows(data, sf, rows, row_mask, head, g, heads: tl.constexpr, dim: tl.constexpr, dims):
++    # rows: [R] slot ids; returns [R, dim] float32.
++    mask = row_mask[:, None] & (dims[None, :] < dim)
++    byte = tl.load(
++        data + rows[:, None] * (heads * (dim // 2)) + head * (dim // 2) + dims[None, :] // 2,
++        mask=mask,
++        other=0,
++    )
++    nib = (byte >> ((dims[None, :] % 2) * 4).to(tl.uint8)) & 15
++    scale = tl.load(
++        sf + rows[:, None] * (heads * (dim // 16)) + head * (dim // 16) + dims[None, :] // 16,
++        mask=mask,
++        other=0,
++    )
++    scale = scale.to(tl.float8e4nv, bitcast=True).to(tl.float32)
++    return _e2m1_to_f32(nib) * scale * g
++
++
++@triton.jit
++def _compact_kv_nvfp4(
++    k,
++    v,
++    k_sf,
++    v_sf,
++    k_g,
++    v_g,
++    req_to_token,
++    req_indices,
++    indices,
++    seq_lens,
++    cu_k,
++    out_k,
++    out_v,
++    topk: tl.constexpr,
++    heads: tl.constexpr,
++    dim: tl.constexpr,
++    req_stride: tl.constexpr,
++    idx_stride: tl.constexpr,
++    BLOCK_TOPK: tl.constexpr,
++    BLOCK_D: tl.constexpr,
++):
++    # Same row selection as sparse_attn._compact_kv; only the element read differs.
++    batch, head, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
++    cols = block * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
++    dims = tl.arange(0, BLOCK_D)
++    length = tl.load(seq_lens + batch)
++    req = tl.load(req_indices + batch)
++    pack_start = tl.load(cu_k + batch)
++    valid_count = tl.load(cu_k + batch + 1) - pack_start
++    positions = tl.load(indices + batch * idx_stride + cols, mask=cols < topk, other=-1)
++    valid = (cols < valid_count) & (positions >= 0) & (positions < length)
++    slots = tl.load(
++        req_to_token + req * req_stride + tl.where(valid, positions, 0),
++        mask=valid,
++        other=0,
++    ).to(tl.int64)
++    dst = (pack_start + cols)[:, None].to(tl.int64) * heads * dim + head * dim + dims[None, :]
++    mask = valid[:, None] & (dims[None, :] < dim)
++    kv = _dequant_rows(k, k_sf, slots, valid, head, tl.load(k_g), heads, dim, dims)
++    tl.store(out_k + dst, kv.to(out_k.dtype.element_ty), mask=mask)
++    vv = _dequant_rows(v, v_sf, slots, valid, head, tl.load(v_g), heads, dim, dims)
++    tl.store(out_v + dst, vv.to(out_v.dtype.element_ty), mask=mask)
++
++
++def qwen_sparse_kv_extraction_compact_nvfp4_triton(
++    k, v, k_sf, v_sf, k_g, v_g, req_to_token, req_indices, indices, seq_lens, cu_k,
++    out_k, out_v, batch, topk,
++):
++    """NVFP4 twin of qwen_sparse_kv_extraction_compact_triton.
++
++    k/v: packed ``[slots, heads, dim/2]`` uint8; k_sf/v_sf: ``[slots, heads, dim/16]``
++    (any 1-byte dtype); k_g/v_g: 1-element float32 device tensors (graph-safe);
++    out_k/out_v: ``[rows, heads, dim]`` FP8 E4M3 or BF16 scratch.
++    """
++    _, heads, half = k.shape
++    dim = half * 2
++    block_topk = 16
++    _compact_kv_nvfp4[(batch, heads, triton.cdiv(topk, block_topk))](
++        k.view(torch.uint8),
++        v.view(torch.uint8),
++        k_sf.view(torch.uint8),
++        v_sf.view(torch.uint8),
++        k_g,
++        v_g,
++        req_to_token,
++        req_indices,
++        indices,
++        seq_lens,
++        cu_k,
++        out_k,
++        out_v,
++        topk,
++        heads,
++        dim,
++        req_to_token.stride(0),
++        indices.stride(0),
++        BLOCK_TOPK=block_topk,
++        BLOCK_D=triton.next_power_of_2(dim),
++        num_warps=8,
++    )
++
++
++@triton.jit
++def _gather_dequant(
++    data,
++    sf,
++    g,
++    index,
++    out,
++    n,
++    heads: tl.constexpr,
++    dim: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    BLOCK_D: tl.constexpr,
++):
++    pid, head = tl.program_id(0), tl.program_id(1)
++    rows = pid * BLOCK_N + tl.arange(0, BLOCK_N)
++    dims = tl.arange(0, BLOCK_D)
++    row_mask = rows < n
++    slots = tl.load(index + rows, mask=row_mask, other=0).to(tl.int64)
++    x = _dequant_rows(data, sf, slots, row_mask, head, tl.load(g), heads, dim, dims)
++    dst = rows[:, None].to(tl.int64) * heads * dim + head * dim + dims[None, :]
++    tl.store(out + dst, x.to(out.dtype.element_ty), mask=row_mask[:, None] & (dims[None, :] < dim))
++
++
++def nvfp4_gather_dequant(data, sf, g, index, out_dtype):
++    """``data.index_select(0, index)`` for an NVFP4 layer, dequantized to out_dtype.
++
++    Returns ``[len(index), heads, dim]`` -- the same packed full-context tensor
++    the prefix chunk-prefill kernel already consumes for FP8 caches.
++    """
++    _, heads, half = data.shape
++    dim = half * 2
++    n = index.numel()
++    out = torch.empty((n, heads, dim), dtype=out_dtype, device=data.device)
++    if n == 0:
++        return out
++    block_n = 16
++    _gather_dequant[(triton.cdiv(n, block_n), heads)](
++        data.view(torch.uint8),
++        sf.view(torch.uint8),
++        g,
++        index,
++        out,
++        n,
++        heads,
++        dim,
++        BLOCK_N=block_n,
++        BLOCK_D=triton.next_power_of_2(dim),
++        num_warps=8,
++    )
++    return out
++
++
++def reference_dequant(data, sf, g, out_dtype=torch.float32):
++    """Independent PyTorch reference: ``[m, heads, dim/2]`` + ``[m, heads, dim/16]`` -> ``[m, heads, dim]``."""
++    lut = torch.tensor(
++        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
++        dtype=torch.float32,
++        device=data.device,
++    )
++    b = data.view(torch.uint8)
++    m, heads, half = b.shape
++    codes = torch.empty((m, heads, half * 2), dtype=torch.long, device=data.device)
++    codes[..., 0::2] = (b & 0x0F).long()
++    codes[..., 1::2] = (b >> 4).long()
++    vals = lut[codes].view(m, heads, half * 2 // 16, 16)
++    scale = sf.view(torch.uint8).view(torch.float8_e4m3fn).float().unsqueeze(-1)
++    return (vals * scale * g.float().reshape(())).view(m, heads, half * 2).to(out_dtype)
+diff -ruN a/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py b/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
+--- a/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py	2026-10-12 10:59:18
++++ b/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py	2026-10-12 10:59:18
+@@ -8,6 +8,7 @@
+ 
+ import logging
+ import math
++import os
+ from copy import copy
+ from functools import lru_cache
+ from typing import Dict, Optional, Tuple
+@@ -37,6 +38,10 @@
+     pending_ring_groups,
+     pending_ring_groups_required,
+ )
++from sglang.srt.layers.attention.qsa.nvfp4_kv import (
++    nvfp4_gather_dequant,
++    qwen_sparse_kv_extraction_compact_nvfp4_triton,
++)
+ from sglang.srt.layers.attention.qsa.sparse_attn import (
+     qwen_sparse_fa2_cu_seqlens_triton,
+     qwen_sparse_kv_extraction_compact_triton,
+@@ -409,6 +414,14 @@
+         # every CUDA graph bakes lives as long as the graphs that reference it.
+         self._trtllm_workspace = None
+         self._trtllm_scratch_shareable = _trtllm_scratch_is_shareable(runner)
++        # NVFP4 KV (local): gathers dequantize into a scratch of this dtype, so the
++        # downstream decode/prefill kernels see the same layout as an FP8 cache.
++        self._nvfp4_scratch_dtype = (
++            torch.bfloat16
++            if os.environ.get("SGLANG_QSA_NVFP4_SCRATCH", "fp8") == "bf16"
++            else torch.float8_e4m3fn
++        )
++        self._kv_quant_method = False  # resolved lazily; False = not looked up yet
+         self._graph_extend_lens = None
+         self._graph_extend_lens_pin = None
+         self.qsa_stall_diagnostics = (
+@@ -417,6 +430,31 @@
+         if self.qsa_stall_diagnostics is not None:
+             logger.info("QSA stall diagnostics enabled (30s stall threshold)")
+ 
++    def _nvfp4_view(self, layer):
++        """(k_fp4, v_fp4, k_sf, v_sf, k_global, v_global) when the pool stores NVFP4, else None."""
++        if self._kv_quant_method is False:
++            getter = getattr(self.token_to_kv_pool, "get_kv_cache_quant_method", None)
++            self._kv_quant_method = getter() if getter is not None else None
++        qm = self._kv_quant_method
++        if getattr(qm, "name", None) != "nvfp4":
++            return None
++        k, v, k_sf, v_sf = self.token_to_kv_pool.get_raw_kv_buffer(layer.layer_id)
++        lid = layer.layer_id
++        # Device slices, not Python floats: CUDA graphs must read them at replay.
++        return k, v, k_sf, v_sf, qm.k_scales_gpu[lid : lid + 1], qm.v_scales_gpu[lid : lid + 1]
++
++    def _set_kv_buffer(self, layer, loc, k, v):
++        nvfp4 = self._nvfp4_view(layer)
++        if nvfp4 is None:
++            self.token_to_kv_pool.set_kv_buffer(layer, loc, k, v)
++            return
++        # HybridLinearKVPool.set_kv_buffer defaults k_scale/v_scale to the float 1.0,
++        # which makes the NVFP4 quantizer build a CUDA tensor from a Python float --
++        # a CPU->GPU copy that CUDA graph capture rejects. Pass the device scales.
++        self.token_to_kv_pool.set_kv_buffer(
++            layer, loc, k, v, k_scale=nvfp4[4], v_scale=nvfp4[5]
++        )
++
+     @staticmethod
+     def _is_speculative_paged_mode(forward_mode) -> bool:
+         if forward_mode is None:
+@@ -1778,9 +1816,7 @@
+         if topk_indices is None:
+             raise ValueError("QSA sparse attention requires topk_indices")
+         if save_kv_cache:
+-            self.token_to_kv_pool.set_kv_buffer(
+-                layer, forward_batch.out_cache_loc, k, v
+-            )
++            self._set_kv_buffer(layer, forward_batch.out_cache_loc, k, v)
+         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
+         num_output_rows = q.shape[0]
+         num_valid_rows = topk_indices.shape[0]
+@@ -1799,6 +1835,8 @@
+             )
+             return self._pad_extend_output(output, num_output_rows)
+         if not q.is_cuda:
++            if self._nvfp4_view(layer) is not None:
++                raise NotImplementedError("QSA NVFP4 KV has no CPU path")
+             metadata = self._resolve_metadata(forward_batch)
+             slots = self._logical_to_physical(topk_indices, metadata)
+             pool = self.token_to_kv_pool
+@@ -1839,8 +1877,10 @@
+         diagnostics = getattr(self, "qsa_stall_diagnostics", None)
+         if diagnostics is not None:
+             diagnostics.mark_before_kv_getters(layer.layer_id, pool)
+-        k_buffer = pool.get_key_buffer(layer.layer_id)
+-        v_buffer = pool.get_value_buffer(layer.layer_id)
++        nvfp4 = self._nvfp4_view(layer)
++        if nvfp4 is None:
++            k_buffer = pool.get_key_buffer(layer.layer_id)
++            v_buffer = pool.get_value_buffer(layer.layer_id)
+         if diagnostics is not None:
+             diagnostics.set_phase(layer.layer_id, "before_req_indices_to_list")
+         req_to_token = self.req_to_token_pool.req_to_token
+@@ -1866,12 +1906,25 @@
+             sequence_lens, dtype=torch.int32, device=q.device
+         )
+         cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
++        if nvfp4 is None:
++            packed_k = k_buffer.index_select(0, gather_index)
++            packed_v = v_buffer.index_select(0, gather_index)
++        else:
++            # Same packed full-context tensor the kernel consumes for FP8 caches,
++            # dequantized during the gather (no per-pool workspace).
++            k_fp4, v_fp4, k_sf, v_sf, k_g, v_g = nvfp4
++            packed_k = nvfp4_gather_dequant(
++                k_fp4, k_sf, k_g, gather_index, self._nvfp4_scratch_dtype
++            )
++            packed_v = nvfp4_gather_dequant(
++                v_fp4, v_sf, v_g, gather_index, self._nvfp4_scratch_dtype
++            )
+         if diagnostics is not None:
+             diagnostics.set_phase(layer.layer_id, "before_sparse_attention")
+         output = sparse_gqa_fwd_interface_triton_ck(
+             q.contiguous(),
+-            k_buffer.index_select(0, gather_index),
+-            v_buffer.index_select(0, gather_index),
++            packed_k,
++            packed_v,
+             topk_indices,
+             cu_seqlens_q,
+             cu_seqlens_k,
+@@ -1979,6 +2032,7 @@
+         metadata,
+         topk_indices: torch.Tensor,
+         trtllm_decode,
++        nvfp4=None,
+     ) -> torch.Tensor:
+         """Selected KV packs into page-aligned row strides so a static
+         arange block table can drive FlashInfer's paged decode API;
+@@ -2003,32 +2057,51 @@
+             batch, pages_per_row, page, device
+         )
+         capacity_rows = self._cuda_graph_max_tokens if metadata.is_cuda_graph else batch
++        if nvfp4 is None:
++            num_kv_heads, head_dim = k_buffer.shape[1], k_buffer.shape[2]
++            scratch_dtype = k_buffer.dtype
++        else:
++            num_kv_heads, head_dim = nvfp4[0].shape[1], nvfp4[0].shape[2] * 2
++            scratch_dtype = self._nvfp4_scratch_dtype
+         packed_k, packed_v = self._get_fa2_scratch(
+             max(capacity_rows, batch) * stride,
+-            k_buffer.shape[1],
+-            k_buffer.shape[2],
+-            k_buffer.dtype,
+-            k_buffer.device,
++            num_kv_heads,
++            head_dim,
++            scratch_dtype,
++            device,
+         )
+-        qwen_sparse_kv_extraction_compact_triton(
+-            k_buffer,
+-            v_buffer,
+-            self.req_to_token_pool.req_to_token,
+-            (
+-                metadata.row_req_pool_indices
+-                if metadata.row_req_pool_indices is not None
+-                else forward_batch.req_pool_indices
+-            ),
+-            topk_indices,
+-            sequence_lens,
+-            cu_strided,
+-            packed_k,
+-            packed_v,
+-            batch,
+-            topk,
++        row_req = (
++            metadata.row_req_pool_indices
++            if metadata.row_req_pool_indices is not None
++            else forward_batch.req_pool_indices
+         )
+-        num_kv_heads = k_buffer.shape[1]
+-        head_dim = k_buffer.shape[2]
++        if nvfp4 is None:
++            qwen_sparse_kv_extraction_compact_triton(
++                k_buffer,
++                v_buffer,
++                self.req_to_token_pool.req_to_token,
++                row_req,
++                topk_indices,
++                sequence_lens,
++                cu_strided,
++                packed_k,
++                packed_v,
++                batch,
++                topk,
++            )
++        else:
++            qwen_sparse_kv_extraction_compact_nvfp4_triton(
++                *nvfp4,
++                self.req_to_token_pool.req_to_token,
++                row_req,
++                topk_indices,
++                sequence_lens,
++                cu_strided,
++                packed_k,
++                packed_v,
++                batch,
++                topk,
++            )
+         kc = (
+             packed_k[: batch * stride]
+             .view(-1, page, num_kv_heads, head_dim)
+@@ -2065,9 +2138,7 @@
+         if topk_indices is None:
+             raise ValueError("QSA sparse attention requires topk_indices")
+         if save_kv_cache:
+-            self.token_to_kv_pool.set_kv_buffer(
+-                layer, forward_batch.out_cache_loc, k, v
+-            )
++            self._set_kv_buffer(layer, forward_batch.out_cache_loc, k, v)
+         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
+         return self._forward_paged_attention(q, layer, forward_batch, topk_indices)
+ 
+@@ -2079,9 +2150,15 @@
+         topk_indices: torch.Tensor,
+     ) -> torch.Tensor:
+         pool = self.token_to_kv_pool
+-        k_buffer = pool.get_key_buffer(layer.layer_id)
+-        v_buffer = pool.get_value_buffer(layer.layer_id)
++        nvfp4 = self._nvfp4_view(layer)
++        if nvfp4 is None:
++            k_buffer = pool.get_key_buffer(layer.layer_id)
++            v_buffer = pool.get_value_buffer(layer.layer_id)
++        else:
++            k_buffer = v_buffer = None
+         if not q.is_cuda:
++            if nvfp4 is not None:
++                raise NotImplementedError("QSA NVFP4 KV has no CPU path")
+             metadata = self._resolve_metadata(forward_batch)
+             slots = self._logical_to_physical(topk_indices, metadata)
+             output = qsa_sparse_attention(q, k_buffer, v_buffer, slots, layer.scaling)
+@@ -2100,6 +2177,11 @@
+                 metadata,
+                 topk_indices,
+                 trtllm_decode,
++                nvfp4=nvfp4,
++            )
++        if nvfp4 is not None:
++            raise NotImplementedError(
++                "QSA NVFP4 KV requires the trtllm sparse decode path (SM100/SM120)"
+             )
+ 
+         flash_attn_varlen_func = _resolve_flash_attn_varlen_func()
+diff -ruN a/python/sglang/srt/layers/quantization/fp4_kv_cache_quant_method.py b/python/sglang/srt/layers/quantization/fp4_kv_cache_quant_method.py
+--- a/python/sglang/srt/layers/quantization/fp4_kv_cache_quant_method.py	2026-10-12 10:59:18
++++ b/python/sglang/srt/layers/quantization/fp4_kv_cache_quant_method.py	2026-10-12 10:59:18
+@@ -556,6 +556,21 @@
+         return fp4_size + scale_size + dq_size
+ 
+ 
++class QSANVFP4KVCacheMethod(NVFP4KVCacheMethod):
++    """NVFP4 KV for QSA pools (local extension).
++
++    QSA dequantizes during its own top-k / prefix gathers (qsa/nvfp4_kv.py), so
++    the pool does not need the full-size FP8 dequant workspace the generic
++    recipe allocates for flashinfer prefill (2x slots*heads*dim bytes per pool).
++    """
++
++    def needs_dequant_workspace(self) -> bool:
++        return False
++
++    def dequant_workspace_dtype(self):
++        return None
++
++
+ class FP4MXBlock16KVCacheMethod(KVCacheQuantMethodBase):
+     """Block-16 FP4 E2M1 single-level scaling.
+ 
+diff -ruN a/python/sglang/srt/mem_cache/kv_cache_configurator.py b/python/sglang/srt/mem_cache/kv_cache_configurator.py
+--- a/python/sglang/srt/mem_cache/kv_cache_configurator.py	2026-10-12 10:59:18
++++ b/python/sglang/srt/mem_cache/kv_cache_configurator.py	2026-10-12 10:59:18
+@@ -1628,6 +1628,13 @@
+             )
+         else:
+             pool_class = QSATokenToKVPool
++            if quant_method is not None and quant_method.name == "nvfp4":
++                # Local: QSA gathers dequantize NVFP4 themselves; drop the workspace.
++                from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
++                    QSANVFP4KVCacheMethod,
++                )
++
++                quant_method.__class__ = QSANVFP4KVCacheMethod
+             extra_args.update(
+                 qsa_index_kv_heads=qsa_profile.kv_heads,
+                 qsa_index_head_dim=qsa_profile.head_dim,
+diff -ruN a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+--- a/python/sglang/srt/server_args.py	2026-10-12 10:59:18
++++ b/python/sglang/srt/server_args.py	2026-10-12 10:59:18
+@@ -6639,6 +6639,12 @@
+                     "--kv-cache-dtype=nvfp4 requires Blackwell SM100 or SM120. "
+                     "Use --kv-cache-dtype=fp4_mx_block16 for the block-size-16 FP4 recipe."
+                 )
++            if os.environ.get("SGLANG_QSA_NVFP4_KV") == "1":
++                # Local: QSA layers read NVFP4 through their own dequantizing
++                # gathers (qsa/nvfp4_kv.py); the MHA backend whitelist below
++                # does not describe that path.
++                logger.warning("KV4: QSA NVFP4 KV enabled via SGLANG_QSA_NVFP4_KV=1")
++                return
+             if (
+                 prefill_backend != decode_backend and prefill_backend != "fa4"
+             ):  # Take care of prefill=fa4 later

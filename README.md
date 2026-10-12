@@ -32,13 +32,14 @@ Full numbers: [docs/results.md](docs/results.md). How it works: [docs/design.md]
 |---|---|---|---|
 | `nvfp4-kv` | **required** | `qsa/nvfp4_kv.py` (new), `qwen_sparse_attn_backend.py`, `fp4_kv_cache_quant_method.py`, `kv_cache_configurator.py`, `flashinfer_backend.py`, `server_args.py` | Stores the QSA layers' KV as NVFP4 (packed E2M1 + one E4M3 scale per 16 values). QSA's own top-k and prefix gathers dequantize to FP8 on the fly, so the attention kernels are unchanged and no full-pool dequant workspace is allocated. |
 | `optional-mamba-pingpong-fix` | optional, recommended with `--prefill-decode-interval` | `managers/scheduler.py`, `mem_cache/unified_radix_cache.py` | Fixes a scheduler crash (`Not enough space for mamba ping pong` / `Can not alloc mamba cache`) under mixed long/short agent load. (A) releases the COW-source lock on the early-return path of `cache_unfinished_req`. This part only takes effect with `SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=true`. (B) adds a Mamba-slot admission check before batching. Upstream: sgl-project/sglang#34676, #39787. |
+| `optional-qsa-indexer-splitk` | optional (3.0.1), **independent of NVFP4 KV** | `layers/attention/qsa/mqa.py` | Fixes CTA starvation in the QSA indexer's prefill MQA scoring. At long context the 128 MiB logits budget leaves ~8 CTAs per launch on 188 SMs. Key tiles are now split across CTAs, with the split chosen from the shapes (≈512 CTAs, ≥4 tiles each, no device sync). Logits are bit-identical (each one is still computed by exactly one CTA). Single-launch speedup is 1.6× at 8K and 8.5× at 480K. Served: 490K needle TTFT 66.5 → 52.3 s, 480K main-agent TTFT 74.8 → 61.6 s, decode unchanged. `SGLANG_QSA_MQA_SPLITK=1` disables it; an integer forces a split. The first use of each split value JIT-compiles a TileLang kernel (a one-off ~2 s stall). Keep `TILELANG_CACHE_DIR` on a persistent mount, or prewarm with `tests/test_qsa_mqa_splitk.py`. Idea credit: redashes1984 (fixed split=64). |
 | `optional-recoverssm-budget` | **2.5.3 only**, needed there for `--gdn-mtp-cache-mode none` | `mem_cache/kv_cache_configurator.py` | Correct memory budgeting for conv windows in RecoverSSM none mode. This file also contains the `nvfp4-kv` change and replaces that set's copy. Pennyroyal 3.0 ships an upstream fix (Penny #51), so 3.0.1 has no such set. |
 
 Each set comes in two forms:
 - `overlay/pennyroyal-<ver>/<set>/python/...`: complete replacement files, for bind mounts or `COPY`.
 - `patches/pennyroyal-<ver>/000N-*.patch`: unified diffs against that release's source root. Apply with `git apply` or `patch -p1` in numeric order; 0001 and 0002 also apply on their own.
 
-Available versions: `pennyroyal-3.0.1` (0001, 0002) and `pennyroyal-2.5.3` (0001, 0002, 0003).
+Available versions: `pennyroyal-3.0.1` (0001 NVFP4 KV, 0002 ping-pong fix, 0003 indexer split-K) and `pennyroyal-2.5.3` (0001, 0002, 0003 RecoverSSM budget).
 
 ## Quick start
 
@@ -54,7 +55,7 @@ MODEL_DIR=/path/to/checkpoint ./examples/run-tested-config.sh
 **B. No build: bind-mount the overlay** into the stock Pennyroyal image of the same version (run it as `--user 0:0` or adjust ownership; 3.0 images default to user `penny`):
 
 ```bash
-./examples/overlay-mounts.sh --with-pingpong-fix                                   # 3.0.1
+./examples/overlay-mounts.sh --with-pingpong-fix --with-splitk                     # 3.0.1
 ./examples/overlay-mounts.sh --penny 2.5.3 --with-pingpong-fix --with-recoverssm-budget
 # paste the printed -v/-e lines into your docker run
 ```
@@ -86,6 +87,7 @@ What the tests check:
 - **T3** Decode top-k gather: bit-exact, including `-1` / out-of-range slots and `topk=2051`.
 - **T4** Prefix gather: bit-exact.
 - **T5** Timings.
+- `tests/test_qsa_mqa_splitk.py` (split-K set): bit-exact split vs no split at 8K–480K depth and on a packed batch, a check against the torch reference, and timing per depth. Running it with `/cache` mounted and `TILELANG_CACHE_DIR=/cache/tilelang` also pre-compiles the kernels.
 
 Server log at startup should include `KV4: QSA NVFP4 KV enabled via SGLANG_QSA_NVFP4_KV=1`, and `/get_server_info` should report `"kv_cache_dtype": "nvfp4"`.
 
@@ -108,6 +110,7 @@ Differences here:
 - We dequantize into an **FP8** scratch, so the stock FP8 XQA decode kernel is reused and the gather is faster than the plain FP8 copy. Those projects dequantize to BF16.
 - We ship bit-exact kernel tests against FlashInfer and a paired 24-window NLL measurement.
 - We provide overlays rebased onto each Pennyroyal release.
+- redashes1984 also published the indexer split-K diagnosis and a fixed split=64 patch. Our split-K set is an independent implementation on Pennyroyal 3.0.1 that picks the split adaptively per launch, with bit-exactness tests.
 
 ## License
 
@@ -147,6 +150,7 @@ Apache-2.0, same as SGLang and Pennyroyal. The overlay files are modified copies
 - 已在 Pennyroyal **3.0.1**（10-12 起用于生产）和 2.5.3 上验证过（更早也在 2.5.2 上跑过生产），硬件是 RTX PRO 6000。3.0.1 相对 2.5.3：解码快约 5.6%，冷 prefill 快 12～13%。
 - 3.0 的自适应 MTP 和本补丁可以一起用，但在我们的负载下单路慢 3%，所以生产仍用固定 3 步。
 - 社区里已有思路相同的实现（dspark、redashes1984），见上方 Related work。
+- 可选（3.0.1）：`optional-qsa-indexer-splitk`，修复 QSA indexer 在长上下文 prefill 时 CTA 太少的问题，结果逐位一致，480K 冷启动首字时间缩短 18%。它和 NVFP4 无关，FP8 KV 也能用。思路来自 redashes1984，我们改成了按形状自动选择拆分数。
 - overlay 是整文件替换，不要挂到其他版本上。
 
 完整测试数据见 [docs/results.md](docs/results.md)。

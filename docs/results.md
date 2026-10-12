@@ -96,3 +96,33 @@ The `qwen_sparse_attn_backend.py` merge had one conflict, a trivial init block. 
 | Minimum free VRAM during the suite | 1987 MiB | **2749 MiB** | 1885 MiB |
 
 All NLL intervals include 0. Adaptive MTP raised C1 acceptance from 2.62 to 2.72, but verifying 8 tokens per step cost more than that gained on our prose, tool and Chinese workloads. Only code was faster, by 2.4%.
+
+## 7. QSA indexer split-K and chunk 4096 (Pennyroyal 3.0.1, 2026-10-12)
+
+The `optional-qsa-indexer-splitk` set addresses CTA starvation in the indexer's prefill MQA scoring. With a 128 MiB logits budget, a 480K-deep chunk launches 8 CTAs on 188 SMs. The set splits key tiles across CTAs, choosing the split from the shapes; logits stay bit-identical.
+
+Kernel test (`tests/test_qsa_mqa_splitk.py`, one indexer launch):
+
+| Depth | Rows/launch | Split | Before | Split-K | Speedup | Bit-exact |
+|---|---:|---:|---:|---:|---:|---|
+| 8K | 2048 | 8 | 0.071 ms | 0.043 ms | 1.6× | yes |
+| 32K | 2048 | 8 | 0.21 ms | 0.12 ms | 1.8× | yes |
+| 128K | 992 | 16 | 0.78 ms | 0.30 ms | 2.6× | yes |
+| 256K | 480 | 32 | 1.38 ms | 0.29 ms | 4.8× | yes |
+| 480K | 256 | 64 | 2.48 ms | 0.29 ms | **8.5×** | yes |
+
+Served, same production config. Arm F is now in production.
+
+| Metric | 3.0.1 (chunk 2048) | **+ split-K (F)** | + split-K + chunk 4096 (G) |
+|---|---:|---:|---:|
+| Decode throughput vs 3.0.1, 24-case geomean | 1.000 | 0.994 | 1.000 |
+| Cold prefill 128K / 240K | 11.9K / 10.9K tok/s | 12.1K / 11.6K | 12.8K / 12.3K |
+| 490K three-needle TTFT | 66.5 s | **52.4 s** | 45.9 s |
+| 480K main-agent TTFT | 74.8 s | **61.6 s** | 50.0 s |
+| Longest stall of other streams during a 128K prefill (warm) | 0.22 s | 0.22 s | 0.36 s |
+| Longest subagent stall during the 480K cold prefill (p99) | 0.50 s | 0.32 s (0.30) | 1.34 s (0.48) |
+| Paired NLL vs 3.0.1 (8K / 32K / 128K) | — | +0.003 / +0.020 / +0.002, n.s. | n.s. |
+| Minimum free VRAM during the full suite | 2749 MiB | 2649 MiB | **1001 MiB** (stress) |
+
+- **First-use JIT.** Each new split value, and each new chunk shape, compiles a kernel on first use, which causes a one-off stall of about 2 s. Afterwards the TileLang cache in a persistent `TILELANG_CACHE_DIR` serves it.
+- **Chunk 4096 is not in production.** Adding `--chunked-prefill-size 4096` on top of split-K reaches 50 s, but stress testing dropped headroom to 1.0 GiB with the 1.5M pool. A smaller pool (about 1.4M) should restore the margin; this is untested.

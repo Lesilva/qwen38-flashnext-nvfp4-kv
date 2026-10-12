@@ -15,6 +15,10 @@ COPY overlay/pennyroyal-${PENNY}/nvfp4-kv/python/ /opt/pennyroyal/python/
 # Optional: Mamba ping-pong slot exhaustion fix (recommended with --prefill-decode-interval).
 COPY overlay/pennyroyal-${PENNY}/optional-mamba-pingpong-fix/python/ /opt/pennyroyal/python/
 
+# Optional (3.0.1 only): QSA indexer prefill split-K -- bit-identical logits, faster long-context cold prefill
+# (480K main-agent TTFT -18% on one PRO 6000). Independent of NVFP4 KV; works with FP8 KV too.
+COPY overlay/pennyroyal-${PENNY}/optional-qsa-indexer-splitk/python/ /opt/pennyroyal/python/
+
 # 2.5.3 only: RecoverSSM none-mode budget fix (3.0 ships the upstream fix). Uncomment for PENNY=2.5.3;
 # it replaces kv_cache_configurator.py with a version that contains both changes.
 # COPY overlay/pennyroyal-2.5.3/optional-recoverssm-budget/python/ /opt/pennyroyal/python/

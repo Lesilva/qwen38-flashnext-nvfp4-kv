@@ -1,0 +1,108 @@
+diff -ruN a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+--- a/python/sglang/srt/managers/scheduler.py	2026-10-22 11:29:52
++++ b/python/sglang/srt/managers/scheduler.py	2026-10-22 11:29:52
+@@ -3388,6 +3388,41 @@
+ 
+         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+ 
++    def _mamba_admission_ok(self, req, can_run_list) -> bool:
++        """Local fix: admit only if the static mamba pool can cover every slot the
++        batch will still allocate (working state + first ping-pong buffer), else the
++        batch alloc asserts and kills the scheduler."""
++        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
++        from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
++
++        pool = self.req_to_token_pool
++        if not isinstance(pool, HybridReqToTokenPool):
++            return True
++
++        def outstanding(r) -> int:
++            n = 1 if r.mamba_pool_idx is None else 0
++            if pool.enable_mamba_extra_buffer and r.mamba_ping_pong_track_buffer is None:
++                n += (
++                    1
++                    if pool.enable_mamba_extra_buffer_lazy
++                    else pool.mamba_ping_pong_track_buffer_size
++                )
++            return n
++
++        need = outstanding(req) + sum(outstanding(r) for r in can_run_list)
++        if need == 0:
++            return True
++        alloc = pool.mamba_allocator
++        avail = alloc.available_size()
++        if avail < need and self.tree_cache is not None and self.tree_cache.supports_mamba():
++            # can_run_list sources are pinned by add_one_req's lock, so this cannot
++            # evict a state an admitted request still has to COW from.
++            self.tree_cache.evict_for_alloc(
++                EvictParams(num_tokens=0, mamba_num=need - avail)
++            )
++            avail = alloc.available_size()
++        return avail >= need
++
+     def _get_new_batch_prefill_raw(
+         self,
+         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
+@@ -3497,9 +3532,8 @@
+                     running_batch.reqs,
+                 )
+ 
+-        mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
+-        if mamba_allocator is not None:
+-            mamba_allocator.alloc_group_begin(len(self.waiting_queue))
++        # Local fix (ping-pong exhaustion): no group prealloc here -- it hides free
++        # slots from _mamba_admission_ok; it was only a batching optimization.
+         # Get requests from the waiting queue to a new prefill batch
+         for req in self.waiting_queue:
+             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
+@@ -3537,6 +3571,10 @@
+                 if loaded_tokens > 0:
+                     req.storage_hit_length = loaded_tokens
+ 
++            if not self._mamba_admission_ok(req, adder.can_run_list):
++                # Stay queued (keep FCFS order); running requests free slots as
++                # they finish or cross a track boundary.
++                break
+             req.init_next_round_input(self.tree_cache)
+             if (
+                 self.enable_hicache_storage
+@@ -3591,9 +3629,6 @@
+                         )
+                         req.mamba_pool_idx = None
+                 break
+-
+-        if mamba_allocator is not None:
+-            mamba_allocator.alloc_group_end()
+ 
+         # Update waiting queue
+         can_run_list: List[Req] = adder.can_run_list
+diff -ruN a/python/sglang/srt/mem_cache/unified_radix_cache.py b/python/sglang/srt/mem_cache/unified_radix_cache.py
+--- a/python/sglang/srt/mem_cache/unified_radix_cache.py	2026-10-22 11:29:52
++++ b/python/sglang/srt/mem_cache/unified_radix_cache.py	2026-10-22 11:29:52
+@@ -951,6 +951,26 @@
+ 
+         if effective_cache_len <= 0:
+             req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
++            # Local fix (ping-pong exhaustion): no checkpoint was donated this round
++            # (extend below the checkpoint grid, or donation skipped under pressure),
++            # so the relock below never runs and the admission lock would pin the
++            # COW source's mamba slot for the whole request. Apply the same
++            # skip-MAMBA relock as the normal path; the source was already COW'd.
++            if (
++                not chunked
++                and envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get()
++                and ComponentType.MAMBA in self.tree_components
++                and req.last_node is not None
++                and req.last_node
++                not in (req.skip_lock_node_ids or {}).get(ComponentType.MAMBA, ())
++            ):
++                self._dec_req_lock(req)
++                lock_result = self.inc_lock_ref(
++                    req.last_node, skip_lock_components=(ComponentType.MAMBA,)
++                )
++                req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
++                req.skip_lock_node_ids = lock_result.skip_lock_node_ids
++                req.swa_prefix_lock_released = False
+             for comp in self._components_tuple:
+                 comp.cleanup_after_caching_req(
+                     req, is_finished=False, insert_params=insert_params

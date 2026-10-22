@@ -126,3 +126,28 @@ Served, same production config. Arm F is now in production.
 
 - **First-use JIT.** Each new split value, and each new chunk shape, compiles a kernel on first use, which causes a one-off stall of about 2 s. Afterwards the TileLang cache in a persistent `TILELANG_CACHE_DIR` serves it.
 - **Chunk 4096 is not in production.** Adding `--chunked-prefill-size 4096` on top of split-K reaches 50 s, but stress testing dropped headroom to 1.0 GiB with the 1.5M pool. A smaller pool (about 1.4M) should restore the margin; this is untested.
+
+## 8. Pennyroyal 3.1.1 rebase (production since 2026-10-22)
+
+All five changed files three-way merged without conflicts, and our hunks are line-for-line identical before and after the merge. The other three files (`flashinfer_backend.py`, `fp4_kv_cache_quant_method.py`, `qsa/mqa.py`) are unchanged in 3.1.1, so 3.0.1's copies were reused. The 3.1.1 upstream changes in the merged files are small: QSA packed scratch is zero-initialised, the scheduler filters finished requests before admission and counts held rows once, and server_args gains `trust_request_chat_template`.
+
+The configuration is production F (3.0.1 + all three sets, chunk 2048, 1.5M NVFP4 pool, 16 streams, 48 Mamba slots, 524K YaRN). Arm A keeps Penny's NEXTN MTP (3 steps) with our 96K FR-Spec map. Arm B swaps in Penny 3.1's DFlash2 speculative settings (`incoai/Qwen3.8-Flash-Next-DFlash2`, block 6 at C1 and block 4 at C2+, 2048-token draft window, FP8 draft KV, prefill CUDA graphs off) and leaves everything else the same.
+
+The #17 probe was revised for this round: 12 prompts × 6 decode-checkpoint boundaries, reported with a bootstrap 95% CI, and re-measured on live F just before the window.
+
+| Metric | 3.0.1 F (prev. prod) | **3.1.1 A, NEXTN (now prod)** | 3.1.1 B, DFlash2 |
+|---|---:|---:|---:|
+| Unit tests (NVFP4 KV T1–T5, split-K S1–S3) | pass | pass | — |
+| Functional / Responses / stress (768 req) | pass | pass | pass |
+| Concurrency suite | pass | pass | **fail** (never reached 16 simultaneous decodes in the mixed long/short batch) |
+| Decode throughput vs F, 32-case geomean | 1.000 | **1.002** (min 0.945) | vs A: C1 **0.883**, rest 0.950, min 0.795 |
+| C1 decode, tok/s (zh / code / en / tool) | 223 / 252 / 218 / 232 | 221 / 249 / 220 / 231 | 176 / 237 / 199 / 204 |
+| Acceptance, C1 / all | 2.57 / 2.45 | 2.55 / 2.45 | 2.84 / 2.43 (block 6 at C1) |
+| Cold prefill 128K / 240K | 12.1 / 11.6 K tok/s | 12.2 / 11.7 K | — |
+| 490K needle / 480K main-agent TTFT | 52.4 / 61.6 s | **52.0 / 61.2 s** | 48.2 / **173.1 s** |
+| Paired NLL vs F (8K / 32K / 128K) | — | −0.003 / −0.015 / −0.009 (n.s.) | — |
+| #17 probe, warm-vs-cold mean abs logprob [95% CI] | 0.066 [0.042, 0.090] | **0.061 [0.048, 0.075]** | **3.99 [3.52, 4.42]**, 4 next-token mismatches |
+| Minimum free VRAM during the suite | 2649 MiB | **2669 MiB** | — |
+| Weights / free after startup | 70.97 / 4.04 GB | 70.97 / 4.04 GB | 70.97 / 4.11 GB (the NEXTN MTP layer is still loaded) |
+
+With these sets, DFlash2 was slower at C1, especially on Chinese, and much slower on 480K cold prefill. It also gave wrong results when resuming from decode-time Mamba checkpoints. A likely suspect is our `extra_buffer_lazy` strategy (Penny's DFlash2 profile uses `extra_buffer` and FP8 KV), but we have not isolated the cause. Production stays on NEXTN.

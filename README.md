@@ -19,9 +19,10 @@ Full numbers: [docs/results.md](docs/results.md). How it works: [docs/design.md]
 
 ## Status
 
-- **Pennyroyal 3.0.1** (`ghcr.io/jpezzulli/sglang-rtxpro6000@sha256:25400f56…`): in production since 2026-10-12, full suite passed. Relative to our 2.5.3 deployment, it is +5.6% decode (geomean; +13–18% at 1–2 streams) and +12–13% cold prefill.
+- **Pennyroyal 3.1.1** (`ghcr.io/jpezzulli/sglang-rtxpro6000@sha256:f2a6a8ca…`): in production since 2026-10-22, full suite passed. The rebase was a clean three-way merge with our hunks unchanged; decode, prefill, quality, long-context and headroom match 3.0.1 (decode geomean 1.002). We keep Penny's NEXTN MTP profile, which Penny 3.1 marks deprecated in favour of DFlash2 (see Limitations).
+- **Pennyroyal 3.0.1** (`…@sha256:25400f56…`): ran in production 2026-10-12 → 10-22, full suite passed. Relative to our 2.5.3 deployment, it is +5.6% decode (geomean; +13–18% at 1–2 streams) and +12–13% cold prefill.
 - **Pennyroyal 2.5.3** (`…@sha256:81d4d3d1…`): validated and ran in production 09-28 → 10-12. Earlier, the same code ran on 2.5.2.
-- Both releases are on the SGLang 0.5.19 integration base.
+- All three releases are on the SGLang 0.5.19 integration base.
 - Hardware: **1× RTX PRO 6000 Blackwell 96 GB (SM120)**, 350 W cap. Other SM100/SM120 GPUs should work but are untested.
 - Checkpoint used: `jpezzulli/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4` (NVFP4 weights). Any Qwen3.8 Flash-Next checkpoint that Pennyroyal serves through its QSA backend should work; others are untested.
 - Not upstream. Upstream SGLang has no QSA NVFP4 KV path yet (as of 2026-10-12). vLLM has an open PR for Qwen4Exp (#54846). See [Related work](#related-work) for community implementations.
@@ -39,7 +40,7 @@ Each set comes in two forms:
 - `overlay/pennyroyal-<ver>/<set>/python/...`: complete replacement files, for bind mounts or `COPY`.
 - `patches/pennyroyal-<ver>/000N-*.patch`: unified diffs against that release's source root. Apply with `git apply` or `patch -p1` in numeric order; 0001 and 0002 also apply on their own.
 
-Available versions: `pennyroyal-3.0.1` (0001 NVFP4 KV, 0002 ping-pong fix, 0003 indexer split-K) and `pennyroyal-2.5.3` (0001, 0002, 0003 RecoverSSM budget).
+Available versions: `pennyroyal-3.1.1` and `pennyroyal-3.0.1` (0001 NVFP4 KV, 0002 ping-pong fix, 0003 indexer split-K) and `pennyroyal-2.5.3` (0001, 0002, 0003 RecoverSSM budget).
 
 ## Quick start
 
@@ -48,14 +49,15 @@ Available versions: `pennyroyal-3.0.1` (0001 NVFP4 KV, 0002 ping-pong fix, 0003 
 ```bash
 git clone https://github.com/Lesilva/qwen38-flashnext-nvfp4-kv
 cd qwen38-flashnext-nvfp4-kv
-docker build -t qwen38-nvfp4-kv:3.0.1 .      # see the Dockerfile header for 2.5.3
+docker build -t qwen38-nvfp4-kv:3.1.1 .      # see the Dockerfile header for 3.0.1 / 2.5.3
 MODEL_DIR=/path/to/checkpoint ./examples/run-tested-config.sh
 ```
 
 **B. No build: bind-mount the overlay** into the stock Pennyroyal image of the same version (run it as `--user 0:0` or adjust ownership; 3.0 images default to user `penny`):
 
 ```bash
-./examples/overlay-mounts.sh --with-pingpong-fix --with-splitk                     # 3.0.1
+./examples/overlay-mounts.sh --with-pingpong-fix --with-splitk                     # 3.1.1
+./examples/overlay-mounts.sh --penny 3.0.1 --with-pingpong-fix --with-splitk
 ./examples/overlay-mounts.sh --penny 2.5.3 --with-pingpong-fix --with-recoverssm-budget
 # paste the printed -v/-e lines into your docker run
 ```
@@ -99,6 +101,7 @@ Server log at startup should include `KV4: QSA NVFP4 KV enabled via SGLANG_QSA_N
 - NVFP4 is storage-only. Attention still runs on an FP8 scratch buffer (`SGLANG_QSA_NVFP4_SCRATCH=bf16` switches it to BF16; we measured no quality difference).
 - Checkpoint KV scales are not loaded (global scale = 1.0, same as the stock FP8 path).
 - Tested with `--mamba-radix-cache-strategy extra_buffer_lazy`, MTP 3 steps, page size 64. On 3.0.1 we also served 3.0's adaptive MTP (4/8-token width at C1) with this patch set: it passed the full suite, but on our workload it was 3% slower at C1 than fixed MTP and used 0.86 GiB more VRAM, so production stays on fixed MTP. Other combinations are untested.
+- **DFlash2 (Penny 3.1's new default) is not validated with this patch set.** On 3.1.1 we served Penny's DFlash2 speculative settings on top of these sets (NVFP4 KV, `extra_buffer_lazy`, 16 streams, 1.5M pool). C1 decode was 12% slower than NEXTN, 480K cold TTFT went from 61 s to 173 s, the concurrency test failed, and resuming from decode-time Mamba checkpoints produced wrong logprobs (#17 probe 3.99 vs 0.06). Penny's own DFlash2 profile uses FP8 KV and `extra_buffer`, which we have not tested with these sets. Use NEXTN with these patches.
 
 ## Related work
 
@@ -147,10 +150,11 @@ Apache-2.0, same as SGLang and Pennyroyal. The overlay files are modified copies
 **注意**：
 - 完整的服务测试是在三组补丁一起装的情况下做的；只装 `nvfp4-kv` 的组合还没有单独起服务测过。
 - `--max-total-tokens` 必须手动指定，因为容量规划还没有修正。
-- 已在 Pennyroyal **3.0.1**（10-12 起用于生产）和 2.5.3 上验证过（更早也在 2.5.2 上跑过生产），硬件是 RTX PRO 6000。3.0.1 相对 2.5.3：解码快约 5.6%，冷 prefill 快 12～13%。
+- 已在 Pennyroyal **3.1.1**（10-22 起用于生产，补丁三方合并无冲突，速度、精度和 3.0.1 持平）、3.0.1 和 2.5.3 上验证过（更早也在 2.5.2 上跑过生产），硬件是 RTX PRO 6000。3.0.1 相对 2.5.3：解码快约 5.6%，冷 prefill 快 12～13%。
 - 3.0 的自适应 MTP 和本补丁可以一起用，但在我们的负载下单路慢 3%，所以生产仍用固定 3 步。
 - 社区里已有思路相同的实现（dspark、redashes1984），见上方 Related work。
-- 可选（3.0.1）：`optional-qsa-indexer-splitk`，修复 QSA indexer 在长上下文 prefill 时 CTA 太少的问题，结果逐位一致，480K 冷启动首字时间缩短 18%。它和 NVFP4 无关，FP8 KV 也能用。思路来自 redashes1984，我们改成了按形状自动选择拆分数。
+- 可选（3.0.1、3.1.1）：`optional-qsa-indexer-splitk`，修复 QSA indexer 在长上下文 prefill 时 CTA 太少的问题，结果逐位一致，480K 冷启动首字时间缩短 18%。它和 NVFP4 无关，FP8 KV 也能用。思路来自 redashes1984，我们改成了按形状自动选择拆分数。
+- Penny 3.1 默认改用 DFlash2，并把原生 MTP 标为弃用。我们在 3.1.1 上把 DFlash2 和这套补丁一起测过：单路慢 12%、480K 冷启动从 61 秒变成 173 秒、并发测试失败，而且从 Mamba 解码检查点续算的结果是错的。所以配合本补丁请继续用 NEXTN MTP。
 - overlay 是整文件替换，不要挂到其他版本上。
 
 完整测试数据见 [docs/results.md](docs/results.md)。

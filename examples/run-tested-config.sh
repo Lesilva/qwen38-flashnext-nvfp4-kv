@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # The exact serving configuration this patch set runs in production with
-# (Pennyroyal 3.0.1, 1x RTX PRO 6000 Blackwell 96 GB, 350 W, 89 GiB host RAM).
+# (Pennyroyal 3.1.1, 1x RTX PRO 6000 Blackwell 96 GB, 350 W, 89 GiB host RAM).
 # Adjust MODEL_DIR and anything marked "checkpoint-specific" for your setup.
 set -euo pipefail
-IMAGE="${IMAGE:-qwen38-nvfp4-kv:3.0.1}"      # built from ../Dockerfile
+IMAGE="${IMAGE:-qwen38-nvfp4-kv:3.1.1}"      # built from ../Dockerfile
 MODEL_DIR="${MODEL_DIR:?set MODEL_DIR to the checkpoint directory}"
 PORT="${PORT:-30000}"
 

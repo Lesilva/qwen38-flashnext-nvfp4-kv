@@ -127,7 +127,7 @@ Served, same production config. Arm F is now in production.
 - **First-use JIT.** Each new split value, and each new chunk shape, compiles a kernel on first use, which causes a one-off stall of about 2 s. Afterwards the TileLang cache in a persistent `TILELANG_CACHE_DIR` serves it.
 - **Chunk 4096 is not in production.** Adding `--chunked-prefill-size 4096` on top of split-K reaches 50 s, but stress testing dropped headroom to 1.0 GiB with the 1.5M pool. A smaller pool (about 1.4M) should restore the margin; this is untested.
 
-## 8. Pennyroyal 3.1.1 rebase (production since 2026-10-22)
+## 8. Pennyroyal 3.1.1 rebase (production 2026-10-22 → 11-05)
 
 All five changed files three-way merged without conflicts, and our hunks are line-for-line identical before and after the merge. The other three files (`flashinfer_backend.py`, `fp4_kv_cache_quant_method.py`, `qsa/mqa.py`) are unchanged in 3.1.1, so 3.0.1's copies were reused. The 3.1.1 upstream changes in the merged files are small: QSA packed scratch is zero-initialised, the scheduler filters finished requests before admission and counts held rows once, and server_args gains `trust_request_chat_template`.
 
@@ -151,3 +151,30 @@ The #17 probe was revised for this round: 12 prompts × 6 decode-checkpoint boun
 | Weights / free after startup | 70.97 / 4.04 GB | 70.97 / 4.04 GB | 70.97 / 4.11 GB (the NEXTN MTP layer is still loaded) |
 
 With these sets, DFlash2 was slower at C1, especially on Chinese, and much slower on 480K cold prefill. It also gave wrong results when resuming from decode-time Mamba checkpoints. A likely suspect is our `extra_buffer_lazy` strategy (Penny's DFlash2 profile uses `extra_buffer` and FP8 KV), but we have not isolated the cause. Production stays on NEXTN.
+
+## 9. Pennyroyal 3.1.5 rebase (production since 2026-11-05)
+
+Three of the eight upstream files changed between 3.1.1 and 3.1.5 (`qwen_sparse_attn_backend.py`, `managers/scheduler.py`, `kv_cache_configurator.py`). All merged without conflicts, and the hunks of all three patches are identical to the 3.1.1 ones. The upstream changes that matter for this configuration:
+- **QSA pending index-key ring** (3.1.3, Penny #130, from sgl-project/sglang#46125): a 2–4-token verify window now gets 2 ring groups instead of 1. For fixed 3-step / 4-token NEXTN this was a real bug: the window's later rows overwrote retained prefix keys before the group they complete was compressed. In this launch `pending_ring_groups_required(draft_tokens=4, compress_ratio=4)` now returns 2, where it returned 1 on 3.1.1.
+- Truncated hybrid-Mamba prefill chunks end on a page boundary (Penny #131), the scheduler reopens admission on an empty batch (#132), and Mamba checkpoint copies are chunked to 64 MiB (3.1.5).
+
+The configuration is unchanged from 3.1.1 (all three sets, NEXTN 3 steps + 96K FR-Spec, chunk 2048, 1.5M NVFP4 pool, 16 streams, 48 Mamba slots, 524K YaRN). The baseline is the 3.1.1 arm A run from §8 for speed and quality, and probes re-measured on live 3.1.1 just before the window.
+
+| Metric | 3.1.1 (prev. prod) | **3.1.5 (now prod)** |
+|---|---:|---:|
+| Unit tests (NVFP4 KV T1–T5, split-K S1–S3) | pass | pass |
+| Functional / Responses / stress (768 req) / concurrency | pass | pass |
+| Decode throughput vs 3.1.1, 32-case geomean | 1.000 | **1.005** (min 0.965, en C1) |
+| C1 decode, tok/s (zh / code / en / tool) | 221 / 249 / 220 / 231 | 225 / 246 / 212 / 236 |
+| Acceptance, C1 / all | 2.55 / 2.45 | 2.61 / 2.47 |
+| Cold prefill 8K / 32K / 128K | 12.6 / 12.7 / 12.2 K tok/s | 12.4 / 12.5 / 12.1 K (≈ −1%) |
+| 490K needle / 480K main-agent TTFT | 52.0 / 61.2 s | 52.5 / 61.8 s |
+| Paired NLL vs 3.1.1 (8K / 32K / 128K) | — | +0.007 / −0.007 / −0.013 (n.s.) |
+| #17 probe [95% CI] | 0.057 [0.037, 0.079] | 0.067 [0.041, 0.094] (overlap; 1 next-token mismatch) |
+| Long-context resume probe (~5.9K-token prefix) [95% CI] | 0.041 [0.025, 0.057] | 0.067 [0.036, 0.100] (overlap) |
+| Same probe, cold-vs-cold noise | 0.067 | 0.054 |
+| Minimum free VRAM during the suite | 2669 MiB | **2729 MiB** |
+
+The long-context resume probe is the #17 probe with a ~20K-character reference document in front of each prompt, so the resumed tail also reads the generated part's compressed index keys from the cache. It was meant to show the ring fix directly, but it can't resolve it: two cold prefills of the same long prompt already differ by 0.05–0.07 nat (QSA top-k order, Penny #84), as much as warm vs cold does. Upstream measured the compressed keys themselves (81.5% of generated-part keys mismatched before the fix), not logprobs. A direct check would need a debug hook that reads the KV pool; I have not written one.
+
+Note for anyone writing probes: do not ask `/generate` for input logprobs from position 0 on a long prompt. On an 8K prompt the logprob path allocated 1.9 GiB outside the KV budget and OOM-killed the scheduler at 2.7 GiB free. Tokenize with `/tokenize` and set `logprob_start_len` near the end instead.

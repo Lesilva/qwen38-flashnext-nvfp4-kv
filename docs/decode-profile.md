@@ -1,6 +1,6 @@
 # Where a decode step goes (Pennyroyal 3.1.5, 1× RTX PRO 6000)
 
-Measured 2026-11-14 on my production configuration: OrcaRouter NVFP4 weights, NVFP4 KV, 524K context, NEXTN 3 steps / 4 draft tokens with a 96K FR-Spec map, CUDA graphs on, 350 W cap. Tools: [extras/stepprof](../extras/stepprof).
+Measured 2026-11-14 on my production configuration: OrcaRouter NVFP4 weights, NVFP4 KV, 524K context, NEXTN 3 steps / 4 draft tokens with a 96K FR-Spec map, CUDA graphs on, 350 W cap. Measured with a timing hook in the speculative worker and `torch.profiler`.
 
 ## Summary
 
@@ -57,7 +57,7 @@ Only two kernels grow: the QSA index top-k (0.016 → 0.517 ms per round) and th
 
 ## What I tried
 
-[extras/qfuse](../extras/qfuse): a single-kernel expert MoE (from SSHdotCodes) and a small BF16 GEMV. Result: −4.1% step period at 1 stream, nothing at 2+ streams. The GEMV did not help because of the shared bandwidth above.
+I replaced the expert MoE with a single-kernel implementation and two small BF16 GEMMs with a custom GEMV, loaded out of tree. Result: −4.1% step period at 1 stream and nothing at 2+ streams (benchmark geomean 1.048 at 1 stream, 1.001 at 2–16 streams). The GEMV did not help because of the shared bandwidth above. That is below my adoption bar, so it is not in production and not in this repository.
 
 ## Limits
 

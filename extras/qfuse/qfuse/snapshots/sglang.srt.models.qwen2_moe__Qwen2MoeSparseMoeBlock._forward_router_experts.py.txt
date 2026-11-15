@@ -1,9 +1,0 @@
-    def _forward_router_experts(self, hidden_states: torch.Tensor):
-        # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
-        if self.enable_shared_expert_fusion and TopKOutputChecker.format_is_standard(
-            topk_output
-        ):
-            topk_output = self._append_shared_to_topk_output(topk_output, hidden_states)
-        return self.experts(hidden_states, topk_output)

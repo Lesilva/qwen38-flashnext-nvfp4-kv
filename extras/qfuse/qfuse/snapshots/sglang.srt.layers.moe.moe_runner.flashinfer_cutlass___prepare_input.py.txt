@@ -1,0 +1,25 @@
+def _prepare_input(
+    dispatch_output,
+    quant_info: FlashInferCutlassMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.dtype, int]:
+    x = dispatch_output.hidden_states
+    x_sf = dispatch_output.hidden_states_scale
+
+    if quant_info.quant_type == "fp8":
+        assert quant_info.quant_scales is not None and len(quant_info.quant_scales) == 4
+        x, _ = scaled_fp8_quant(x, quant_info.quant_scales[3])
+        x_sf = None
+        output_dtype = quant_info.output_dtype or dispatch_output.hidden_states.dtype
+        output_col = dispatch_output.hidden_states.shape[1]
+    elif quant_info.quant_type == "fp4":
+        output_dtype = quant_info.output_dtype or torch.bfloat16
+        output_col = x.shape[1]
+        if x_sf is not None and runner_config.is_gated:
+            output_col *= 2
+    else:
+        assert quant_info.quant_type == "bf16"
+        output_dtype = quant_info.output_dtype or x.dtype
+        output_col = x.shape[1]
+
+    return x, x_sf, output_dtype, output_col

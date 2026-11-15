@@ -1,0 +1,20 @@
+@dataclass
+class FlashInferCutlassMoeQuantInfo(MoeQuantInfo):
+    """Payload for FlashInfer CUTLASS fused MoE.
+
+    ``quant_type`` selects the input/weight conventions:
+      - ``"bf16"``: unquantized weights, BF16/FP16 input, no quant scales.
+      - ``"fp8"``: FP8 weights, FP8-quantized input, per-tensor scales.
+      - ``"fp4"``: NVFP4 packed weights and optional NVFP4 packed input.
+    """
+
+    quant_type: str
+    w13_weight: torch.Tensor
+    w2_weight: torch.Tensor
+    quant_scales: Optional[list[torch.Tensor]] = None
+    output_dtype: Optional[torch.dtype] = None
+    moe_tp_size: int = 1
+    moe_tp_rank: int = 0
+    moe_ep_size: int = 1
+    moe_ep_rank: int = 0
+    apply_routed_scaling_factor: bool = True

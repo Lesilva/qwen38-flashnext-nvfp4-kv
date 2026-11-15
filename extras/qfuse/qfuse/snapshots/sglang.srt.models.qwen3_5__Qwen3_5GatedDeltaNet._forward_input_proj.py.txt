@@ -1,0 +1,60 @@
+    def _forward_input_proj(self, hidden_states: torch.Tensor):
+        # AMD/aiter fused AR+RMSNorm+per-group-quant path ships a
+        # ``(bf16, fp8, scale)`` 3-tuple so the FP8 ``in_proj_qkvz`` can
+        # consume ``(fp8, scale)`` (skipping its internal quant) while the
+        # bf16 ``in_proj_ba`` consumes the unquantized bf16. Non-aiter runs skip
+        # the tuple branch and keep the original control flow below unchanged.
+        if _use_aiter and isinstance(hidden_states, tuple):
+            return self._forward_input_proj_fused_quant_amd(hidden_states)
+
+        if (
+            self._fused_in_proj_weight is not None
+            and hidden_states.dtype == torch.bfloat16
+            # At prefill widths cuBLAS serves the merged (m, 4120) shape
+            # ~10% slower than the two original GEMMs; the merged win is
+            # launch count, which only matters at decode sizes.
+            and hidden_states.shape[0] <= 1024
+        ):
+            fused_out = bf16_gemm_dispatch(
+                hidden_states, self._fused_in_proj_weight, None
+            )
+            return (
+                fused_out[:, : self._fused_in_proj_qkvz_width],
+                fused_out[:, self._fused_in_proj_qkvz_width :],
+            )
+
+        if (
+            _is_cpu
+            or _is_npu
+            or check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+        ):
+            DUAL_STREAM_TOKEN_THRESHOLD = 0
+        else:
+            DUAL_STREAM_TOKEN_THRESHOLD = 1024
+
+        seq_len, _ = hidden_states.shape
+        if (
+            self.alt_stream is not None
+            and get_is_capture_mode()
+            and seq_len < DUAL_STREAM_TOKEN_THRESHOLD
+            and _gdn_use_alt_stream
+        ):
+            current_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
+            with torch.cuda.stream(self.alt_stream):
+                projected_states_ba, _ = self.in_proj_ba(hidden_states)
+            current_stream.wait_stream(self.alt_stream)
+        elif self._fused_input_proj_cpu_enabled.value:
+            projected_states_qkvz, projected_states_ba = (
+                torch.ops.sgl_kernel.fused_input_proj_cpu(
+                    hidden_states,
+                    self.in_proj_qkvz.weight,
+                    self.in_proj_ba.weight,
+                    True,
+                )
+            )
+        else:
+            projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
+            projected_states_ba, _ = self.in_proj_ba(hidden_states)
+        return projected_states_qkvz, projected_states_ba

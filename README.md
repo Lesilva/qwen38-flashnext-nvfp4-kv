@@ -95,6 +95,11 @@ What the tests check:
 
 Server log at startup should include `KV4: QSA NVFP4 KV enabled via SGLANG_QSA_NVFP4_KV=1`, and `/get_server_info` should report `"kv_cache_dtype": "nvfp4"`.
 
+## Extras
+
+- **[docs/decode-profile.md](docs/decode-profile.md)**: where a decode step goes on this card (2026-11-14). About two thirds of a single-stream round is weight reads that already run near the card's memory bandwidth, the GPU is busy 97% of the time, and the scheduler issues a round in 1.16 ms. The profiling hook and scripts are in [extras/stepprof](extras/stepprof).
+- **[extras/qfuse](extras/qfuse)** (experimental, not in my production): out-of-tree fused decode kernels loaded by a post-import hook, with a source-hash contract so a Pennyroyal upgrade can only turn them off, never break serving. The one kernel that helps (single-kernel expert MoE, from SSHdotCodes) gives −4.1% step time at 1 stream and nothing at 2+ streams, below my adoption bar.
+
 ## Limitations
 
 - Served and benchmarked with **all sets for that version together**. The sets touch independent code paths, but `nvfp4-kv` alone has not been run as a server yet.
@@ -160,5 +165,7 @@ Apache-2.0, same as SGLang and Pennyroyal. The overlay files are modified copies
 - Penny 3.1 的默认方案仍是原生 NEXTN MTP，DFlash2 是可选的实验性 profile。我们在 3.1.1 上把 DFlash2 和这套补丁一起测过：单路慢 12%、480K 冷启动从 61 秒变成 173 秒、16 路并发时长请求会排队。另外，从 Mamba 解码检查点续算的结果是错的，这是 Penny DFlash 自身的 bug，我报给了作者（#115），已在 3.1.2 修复。配合本补丁请继续用 NEXTN MTP。
 - 如果用固定 4 个 draft token 的 NEXTN（我们的配置），请用 Pennyroyal **3.1.3 及以后**：之前的版本里 QSA pending ring 只有 1 组，验证窗口后面的行会覆盖还没压缩的前缀 key（SGLang #46125，Penny #123）。上下文超过约 2K token 才有影响；Penny 默认的 tiered 策略从宽度 8 起步，不受影响。
 - overlay 是整文件替换，不要挂到其他版本上。
+
+- 附加内容（2026-11-14）：[docs/decode-profile.md](docs/decode-profile.md) 是单路解码每步耗时的拆解，结论是约三分之二的时间在读权重，已接近显存带宽，GPU 97% 的时间在忙；测量钩子在 `extras/stepprof`。`extras/qfuse` 是实验性的外挂融合内核，用源码指纹契约保证 Penny 升级时最多失效、不会出错；实测单路每步快 4.1%，2 路以上没有变化，没有达到我的采用门槛，所以线上没有启用。
 
 完整测试数据见 [docs/results.md](docs/results.md)。

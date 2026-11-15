@@ -1,0 +1,290 @@
+--- a/python/sglang/srt/speculative/eagle_worker_v2.py
++++ b/python/sglang/srt/speculative/eagle_worker_v2.py
+@@ -146,6 +146,260 @@
+     )
+ 
+ 
++
++# ---------------------------------------------------------------------------------------------
++# Local patch (2026-11-14): per-step decode profiling hook. Inert unless STEPPROF_DIR is set.
++# Driven by STEPPROF_DIR/ctl.json: {"id": str, "mode": "nosync"|"wall"|"prof", "steps": N,
++# "skip": K, "bs": optional batch size filter}.
++#   nosync  perf_counter at phase boundaries, no synchronisation (launch-side times)
++#   wall    torch.cuda.synchronize() before every timestamp (true per-phase wall time)
++#   prof    torch.profiler (CPU+CUDA) over N steps with SP:* ranges per phase; with
++#           STEPPROF_MODULES=1 also one range per nn.Module call (eager mode only)
++# Results go to STEPPROF_DIR/<id>.json (+ <id>.table.txt, <id>.trace.json for prof).
++# Every hook entry point swallows its own exceptions and disables the hook on failure.
++# ---------------------------------------------------------------------------------------------
++import json as _sp_json
++import os as _sp_os
++import re as _sp_re
++
++_SP_DIR = _sp_os.environ.get("STEPPROF_DIR", "")
++_SP = {"ctl_mtime": None, "run": None, "done": set(), "dead": False, "last_exit": None, "hooks": []}
++
++
++def _sp_log(msg):
++    try:
++        with open(_sp_os.path.join(_SP_DIR, "hook.log"), "a") as f:
++            f.write(f"{time.time():.3f} {msg}\n")
++    except Exception:
++        pass
++
++
++def _sp_fail(where, e):
++    _SP["dead"] = True
++    _SP["run"] = None
++    _sp_log(f"HOOK DISABLED in {where}: {e!r}")
++    for h in _SP["hooks"]:
++        try:
++            h.remove()
++        except Exception:
++            pass
++    _SP["hooks"] = []
++
++
++def _sp_poll():
++    p = _sp_os.path.join(_SP_DIR, "ctl.json")
++    try:
++        m = _sp_os.stat(p).st_mtime_ns
++    except OSError:
++        return _SP["run"]
++    if m != _SP["ctl_mtime"]:
++        _SP["ctl_mtime"] = m
++        try:
++            with open(p) as f:
++                c = _sp_json.load(f)
++        except Exception as e:
++            _sp_log(f"bad ctl.json: {e!r}")
++            return _SP["run"]
++        cur = _SP["run"]
++        if cur is not None and c.get("id") != cur["cfg"].get("id"):
++            # the driver moved on: flush whatever the unfinished run collected
++            cur["cfg"]["partial"] = True
++            _sp_finish(cur)
++        if (
++            c.get("mode") in ("nosync", "wall", "prof")
++            and c.get("id") not in _SP["done"]
++            and _SP["run"] is None
++        ):
++            _SP["run"] = {"cfg": c, "rows": [], "seen": 0, "prof": None, "outside": None}
++            _SP["last_exit"] = None
++            _sp_log(f"run armed: {c}")
++    return _SP["run"]
++
++
++def _sp_register_modules(model, prefix, depth):
++    from torch.profiler import record_function
++
++    n = 0
++    for name, mod in model.named_modules():
++        if not name or name.count(".") + 1 > depth:
++            continue
++        label = (
++            "M:" + prefix + "/" + _sp_re.sub(r"\.\d+(?=\.|$)", ".*", name)
++            + "<" + type(mod).__name__ + ">"
++        )
++        stack = []
++
++        def pre(m, args, _l=label, _s=stack):
++            rf = record_function(_l)
++            rf.__enter__()
++            _s.append(rf)
++
++        def post(m, args, out, _s=stack):
++            if _s:
++                _s.pop().__exit__(None, None, None)
++
++        _SP["hooks"].append(mod.register_forward_pre_hook(pre))
++        _SP["hooks"].append(mod.register_forward_hook(post))
++        n += 1
++    return n
++
++
++def _sp_prof_start(worker, run):
++    import torch.profiler as tp
++
++    if _sp_os.environ.get("STEPPROF_MODULES", "") == "1":
++        depth = int(_sp_os.environ.get("STEPPROF_DEPTH", "6"))
++        n = _sp_register_modules(worker._target_worker.model_runner.model, "T", depth)
++        dw = worker._draft_worker
++        for i, r in enumerate(getattr(dw, "draft_runner_list", None) or [dw.draft_runner]):
++            n += _sp_register_modules(r.model, f"D{i}", depth)
++        _sp_log(f"registered module ranges: {n}")
++    prof = tp.profile(activities=[tp.ProfilerActivity.CPU, tp.ProfilerActivity.CUDA])
++    prof.__enter__()
++    run["prof"] = prof
++    _sp_log("profiler started")
++
++
++def _sp_begin(worker, batch):
++    if not _SP_DIR or _SP["dead"]:
++        return None
++    try:
++        run = _sp_poll()
++        if run is None:
++            return None
++        cfg = run["cfg"]
++        bs = len(batch.reqs)
++        if cfg.get("bs") and bs != cfg["bs"]:
++            _SP["last_exit"] = None
++            return None
++        run["seen"] += 1
++        if run["seen"] <= cfg.get("skip", 0):
++            return None
++        mode = cfg["mode"]
++        ctx = {"run": run, "mode": mode, "bs": bs, "t": [], "rf": None, "step_rf": None}
++        if mode == "prof":
++            from torch.profiler import record_function
++
++            if run["prof"] is None:
++                _sp_prof_start(worker, run)
++            if run["outside"] is not None:
++                run["outside"].__exit__(None, None, None)
++                run["outside"] = None
++            ctx["step_rf"] = record_function("SP:step")
++            ctx["step_rf"].__enter__()
++            ctx["rf"] = record_function("SP:draft")
++            ctx["rf"].__enter__()
++        elif mode == "wall":
++            torch.cuda.synchronize()
++        ctx["t"].append(time.perf_counter_ns())
++        return ctx
++    except Exception as e:
++        _sp_fail("begin", e)
++        return None
++
++
++def _sp_mark(ctx, nxt):
++    if ctx is None or _SP["dead"]:
++        return
++    try:
++        if ctx["mode"] == "wall":
++            torch.cuda.synchronize()
++        ctx["t"].append(time.perf_counter_ns())
++        if ctx["rf"] is not None:
++            ctx["rf"].__exit__(None, None, None)
++            ctx["rf"] = None
++            if nxt:
++                from torch.profiler import record_function
++
++                ctx["rf"] = record_function("SP:" + nxt)
++                ctx["rf"].__enter__()
++    except Exception as e:
++        _sp_fail("mark", e)
++
++
++def _sp_end(ctx):
++    if ctx is None or _SP["dead"]:
++        return
++    try:
++        run = ctx["run"]
++        if ctx["step_rf"] is not None:
++            ctx["step_rf"].__exit__(None, None, None)
++        t = ctx["t"]
++        run["rows"].append([ctx["bs"], t[0], t[1], t[2], t[3], _SP["last_exit"]])
++        _SP["last_exit"] = t[3]
++        if len(run["rows"]) >= run["cfg"]["steps"]:
++            _sp_finish(run)
++        elif ctx["mode"] == "prof":
++            from torch.profiler import record_function
++
++            run["outside"] = record_function("SP:outside")
++            run["outside"].__enter__()
++    except Exception as e:
++        _sp_fail("end", e)
++
++
++def _sp_finish(run):
++    cfg = run["cfg"]
++    out = {"cfg": cfg, "rows": run["rows"], "time": time.time()}
++    base = _sp_os.path.join(_SP_DIR, str(cfg["id"]))
++    if run["prof"] is not None:
++        if run["outside"] is not None:
++            run["outside"].__exit__(None, None, None)
++            run["outside"] = None
++        torch.cuda.synchronize()
++        prof = run["prof"]
++        prof.__exit__(None, None, None)
++        for h in _SP["hooks"]:
++            h.remove()
++        _SP["hooks"] = []
++        t0 = time.time()
++        try:
++            ka = prof.key_averages()
++            evs = []
++            for e in ka:
++                evs.append(
++                    {
++                        "name": e.key,
++                        "count": e.count,
++                        "cpu_total_us": e.cpu_time_total,
++                        "self_cpu_us": e.self_cpu_time_total,
++                        "dev_total_us": getattr(e, "device_time_total", getattr(e, "cuda_time_total", None)),
++                        "self_dev_us": getattr(e, "self_device_time_total", getattr(e, "self_cuda_time_total", None)),
++                        "device_type": str(getattr(e, "device_type", "")),
++                    }
++                )
++            out["events"] = evs
++            for key in ("self_device_time_total", "self_cuda_time_total", None):
++                try:
++                    txt = ka.table(sort_by=key, row_limit=400, max_name_column_width=110)
++                    break
++                except Exception:
++                    txt = None
++            if txt:
++                with open(base + ".table.txt", "w") as f:
++                    f.write(txt)
++        except Exception as e:
++            out["events_error"] = repr(e)
++        out["key_averages_seconds"] = time.time() - t0
++        t0 = time.time()
++        try:
++            prof.export_chrome_trace(base + ".trace.json")
++        except Exception as e:
++            out["trace_error"] = repr(e)
++        out["trace_seconds"] = time.time() - t0
++    with open(base + ".json.tmp", "w") as f:
++        _sp_json.dump(out, f)
++    _sp_os.replace(base + ".json.tmp", base + ".json")
++    _SP["done"].add(cfg["id"])
++    _SP["run"] = None
++    _SP["last_exit"] = None
++    _sp_log(f"run finished: {cfg['id']} rows={len(run['rows'])}")
++
++
++if _SP_DIR:
++    _sp_log(f"hook loaded in pid {_sp_os.getpid()}")
++
++
+ class EagleDraftWorker(EagleDraftWorkerBase):
+ 
+     # Set by EAGLEWorkerV2._override_worker_state while an extra adaptive runtime
+@@ -1436,6 +1690,7 @@
+                 return batch_output
+         else:
+             self.activate_step_by_batch(batch.seq_lens.shape[0])
++            _sp_ctx = _sp_begin(self, batch)
+ 
+             if batch.spec_info is None:
+                 capture_mode = (
+@@ -1470,7 +1725,9 @@
+                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
+             assert verify_input.is_verify_input()
+             batch.spec_info = verify_input
++            _sp_mark(_sp_ctx, "verify")
+             batch_output = self.verify(batch, grammar_barrier=grammar_barrier)
++            _sp_mark(_sp_ctx, "extend")
+             # Publish before draft_extend so the fence is at verify-end.
+             if on_publish is not None:
+                 on_publish(batch_output.new_seq_lens)
+@@ -1490,6 +1747,8 @@
+                 ):
+                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
+ 
++            _sp_mark(_sp_ctx, None)
++            _sp_end(_sp_ctx)
+             return batch_output
+ 
+     def _build_trivial_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:

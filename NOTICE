@@ -12,3 +12,11 @@ This repository contains modified copies of source files from:
 Files under overlay/ are complete copies of Pennyroyal 2.5.3 sources with the
 changes shown in patches/. python/sglang/srt/layers/attention/qsa/nvfp4_kv.py
 and tests/test_nvfp4_kv.py are new files in this repository.
+
+extras/qfuse/csrc/qf_moe.cu is a modified copy of serve/qwenfast/qf_moe.cu from
+  SSHdotCodes/qwen-3.8-flash-next-pro6000 (https://github.com/SSHdotCodes/qwen-3.8-flash-next-pro6000), commit b19f075
+  Copyright 2026 SSHdotCodes contributors, licensed under the Apache License 2.0.
+The change (persistent scratch allocated by nvfp4_moe_prealloc) is marked in the file.
+
+extras/qfuse/qfuse/snapshots/ holds verbatim excerpts of Pennyroyal 3.1.5 sources, used to diff upgrades.
+extras/stepprof/pennyroyal-3.1.5-step-profile-hook.patch is a diff against a Pennyroyal 3.1.5 source file.

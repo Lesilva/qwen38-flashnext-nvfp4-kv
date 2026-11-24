@@ -25,6 +25,12 @@ COPY overlay/pennyroyal-${PENNY}/optional-mamba-pingpong-fix/python/ /opt/pennyr
 # (480K main-agent TTFT -18% on one PRO 6000). Independent of NVFP4 KV; works with FP8 KV too.
 COPY overlay/pennyroyal-${PENNY}/optional-qsa-indexer-splitk/python/ /opt/pennyroyal/python/
 
+# Optional (3.1.5 only): wide-verify fast paths -- the dense FP8 linears, HC mix and FP8 lm_head keep their W8A16 /
+# MIX2 fast paths up to 64 rows (NEXTN verify at 5-16 streams) and QSA decode top-k runs on many CTAs per row.
+# 6-16 streams +31-50% decode on one PRO 6000. Each path also needs its env flag. Uncomment for PENNY=3.1.5:
+# COPY overlay/pennyroyal-3.1.5/optional-wide-verify/python/ /opt/pennyroyal/python/
+# ENV QWEN_C_MC_TOPK=1 QWEN_EP_HC_WIDE=1 QWEN_I_WIDE_LMHEAD=1 QWEN_J_WIDE_FP8LIN=1
+
 # 2.5.3 only: RecoverSSM none-mode budget fix (3.0 ships the upstream fix). Uncomment for PENNY=2.5.3;
 # it replaces kv_cache_configurator.py with a version that contains both changes.
 # COPY overlay/pennyroyal-2.5.3/optional-recoverssm-budget/python/ /opt/pennyroyal/python/

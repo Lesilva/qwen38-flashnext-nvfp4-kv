@@ -178,3 +178,71 @@ The configuration is unchanged from 3.1.1 (all three sets, NEXTN 3 steps + 96K F
 The long-context resume probe is the #17 probe with a ~20K-character reference document in front of each prompt, so the resumed tail also reads the generated part's compressed index keys from the cache. It was meant to show the ring fix directly, but it can't resolve it: two cold prefills of the same long prompt already differ by 0.05–0.07 nat (QSA top-k order, Penny #84), as much as warm vs cold does. Upstream measured the compressed keys themselves (81.5% of generated-part keys mismatched before the fix), not logprobs. A direct check would need a debug hook that reads the KV pool; I have not written one.
 
 Note for anyone writing probes: do not ask `/generate` for input logprobs from position 0 on a long prompt. On an 8K prompt the logprob path allocated 1.9 GiB outside the KV budget and OOM-killed the scheduler at 2.7 GiB free. Tokenize with `/tokenize` and set `logprob_start_len` near the end instead.
+
+## 10. Wide-verify fast paths (Pennyroyal 3.1.5, production since 2026-11-24)
+
+**The cliff.** Penny's fast paths for the dense online-FP8 linears (W8A16 GEMV), the HC mix (MIX2) and the FP8 lm_head all stop at 16 rows. NEXTN verify with 4 draft tokens runs 4 × batch rows, so from 5 concurrent streams on, every verify step falls off all three:
+- **J:** the dense linears drop to CUTLASS W8A8 with per-token activation quantization, about 40 µs per call whatever the shape. For example, `o_proj` goes from 7.7 µs at 16 rows to 39.8 µs at 20.
+- **E′:** the HC mix drops to per-call dequantization plus BF16 math, 52 µs per call instead of 10 µs.
+- **I:** above 32 rows (9+ streams), the 248K-row lm_head drops to a chunked dequantize + matmul, about 5.6 ms per call instead of about 0.45 ms.
+
+Production logs showed it before any kernel work:
+- 1–4 streams add 2.2–2.8 ms per step for each extra stream;
+- going from 4 to 5 streams adds 8.9 ms;
+- going from 8 to 9 adds 13 ms.
+
+**The set.** `optional-wide-verify` keeps the same weights and formats and adds one env flag per path:
+
+| Flag | Path |
+|---|---|
+| `QWEN_J_WIDE_FP8LIN=1` | Dense online-FP8 linears, 17–64 rows: W8A16 (an M-tiled Triton kernel, or Penny's own split-K kernel launched at M_PAD 32/64), tuned per shape |
+| `QWEN_EP_HC_WIDE=1` | HC MIX2 for 17–64 rows: Penny's three MIX2 kernels with ROWS padded to 32/64 |
+| `QWEN_I_WIDE_LMHEAD=1` | Rowwise-FP8 lm_head and FR-Spec hot head, 17–64 rows: the same M-tiled W8A16 kernel |
+| `QWEN_C_MC_TOPK=1` | QSA decode top-512 as an exact multi-CTA radix select. Stock `fast_topk` runs one CTA per row, so at batch 1 it used 4 of 188 SMs. The cooperative launch has a per-row barrier; on a barrier timeout the last CTA of the row recomputes the row exactly. |
+
+Each path logs one line the first time it is used.
+
+**Kernel numbers** (CUDA graph, cold L2, µs per call). The dense linears are J, the HC mix is E′, the lm_head is I:
+
+| Op | Stock at 20–64 rows | This set |
+|---|---:|---:|
+| `o_proj` / GDN `out_proj` (2560×6144) | 40.7 | 14.2–17.3 |
+| Shared-expert `gate_up` / `down` | 19.4 / 8.3 | 6.0–6.3 / 3.3–3.8 |
+| GDN `in_proj_qkvz` (16384×2560) | 34–40 | 29–32 |
+| HC mix | 49–54 | 11.4–17.2 |
+| lm_head, 48 / 64 rows | ~5,600 | 424 / 470 |
+| QSA decode top-512 (C), 4 rows × 125K | 47.8 | 9.1 |
+
+**Numerics.**
+- J returns the verify rows to the same W8A16 numerics the ≤16-row path uses: relative error vs exact is 0.17%, against 2.6% for stock W8A8 at >16 rows.
+- I is bit-identical to the ≤16-row path.
+- E′ matches it up to atomic-order noise.
+- C selects the same set (ties aside).
+- Batch consistency (the same greedy prompt alone vs. inside 8 / 16 streams, mean |Δlogprob| over the matched prefix) went from 0.039–0.046 to **0.018**.
+
+**Served A/B** (one window: control → candidate → two speculative-step variants → control; then the winner ran the full suite):
+
+| Streams | Control ms/step | This set | Per-stream speed |
+|---|---:|---:|---:|
+| 1 (short) | 9.95 | 9.95 | 1.01 |
+| 1 (230K context) | 10.66 | **10.39** | **1.045** (C) |
+| 2 / 4 | 12.3 / 16.5 | 12.3 / 16.6 | 0.99 / 1.03 |
+| 5 | 25.2 | **18.4** | **1.36** |
+| 8 | 30.1 | **23.1** | **1.31** |
+| 12 | 41.5 | **28.4** | **1.49** |
+| 16 | 46.6 | **32.9** | **1.42** |
+
+**32-case benchmark** against the same-window control:
+
+| Streams | 1 | 2 | 3 | 4 | 6 | 8 | 12 | 16 |
+|---|---|---|---|---|---|---|---|---|
+| Geomean | 0.987 | 0.966 | 1.027 | 1.045 | **1.340** | **1.306** | **1.497** | **1.466** |
+
+- **Overall 1.186**, minimum 0.955 (English, 1 stream).
+- At 1–2 streams the hook's ms/step is identical to the control's. The difference there is acceptance-length noise: at 2 streams the two control runs alone were 2.69 and 2.57.
+- Everything else passed: functional / Responses / stress / concurrency, the 490K needle (TTFT 52.1 s), 480K main agent + 15 subagents (TTFT 58.3 s), paired NLL (no significant change), the #17 and resume probes.
+- Minimum free VRAM was 3.0 GiB, against 2.73 before. The verify CUDA graphs got smaller.
+
+**Fewer draft steps at high concurrency was rejected.** I also tried Penny's adaptive tiers with 1 or 2 NEXTN steps at ≥5 streams. Both lost to fixed 3 steps once the cliff was gone: steps got faster, but acceptance fell from about 2.78 to 2.41 (2 steps) or 1.81 (1 step). An earlier "1 step is +22–24% at 8/16 streams" result was mostly the cliff.
+
+A table that reaches 1 step also makes Penny disable `index_share_for_mtp_iteration` for every width, including 1–4 streams.

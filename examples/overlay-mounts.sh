@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 # Print read-only `-v` mounts for the overlay, to paste into your own `docker run`
 # on top of the stock Pennyroyal image of the same version (no image build needed). Usage:
-#   ./examples/overlay-mounts.sh [--penny 3.1.5|3.1.1|3.0.1|2.5.3] [--with-pingpong-fix] [--with-splitk] [--with-recoverssm-budget]
+#   ./examples/overlay-mounts.sh [--penny 3.1.5|3.1.1|3.0.1|2.5.3] [--with-pingpong-fix] [--with-splitk] [--with-recoverssm-budget] [--with-wide-verify]
+# --with-wide-verify (3.1.5 only) also prints the four env flags that turn its paths on.
 # --with-recoverssm-budget exists for 2.5.3 only; 3.0 ships the upstream fix.
 set -euo pipefail
-PENNY=3.1.5; PINGPONG=0; BUDGET=0; SPLITK=0
+PENNY=3.1.5; PINGPONG=0; BUDGET=0; SPLITK=0; WIDE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --penny) PENNY="$2"; shift ;;
     --with-pingpong-fix) PINGPONG=1 ;;
     --with-splitk) SPLITK=1 ;;
     --with-recoverssm-budget) BUDGET=1 ;;
+    --with-wide-verify) WIDE=1 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
   shift
@@ -20,11 +22,14 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)/overlay/pennyroyal-$PENNY"
 if [ "$SPLITK" = 1 ] && [ ! -d "$ROOT/optional-qsa-indexer-splitk" ]; then
   echo "optional-qsa-indexer-splitk is only shipped for Pennyroyal 3.0.1, 3.1.1 and 3.1.5" >&2; exit 2
 fi
+if [ "$WIDE" = 1 ] && [ ! -d "$ROOT/optional-wide-verify" ]; then
+  echo "optional-wide-verify is only shipped for Pennyroyal 3.1.5" >&2; exit 2
+fi
 if [ "$BUDGET" = 1 ] && [ ! -d "$ROOT/optional-recoverssm-budget" ]; then
   echo "optional-recoverssm-budget is not needed (and not shipped) for Pennyroyal $PENNY" >&2; exit 2
 fi
 emit() {  # emit <set>: one mount per file in that set
-  find "$ROOT/$1" -type f -name '*.py' | sort | while IFS= read -r f; do
+  find "$ROOT/$1" -type f \( -name '*.py' -o -name '*.cuh' \) | sort | while IFS= read -r f; do
     rel="${f#"$ROOT/$1/"}"
     # recoverssm-budget ships a kv_cache_configurator.py that already contains the
     # nvfp4-kv change; when selected, it replaces the nvfp4-kv copy.
@@ -38,4 +43,8 @@ emit nvfp4-kv
 [ "$PINGPONG" = 1 ] && emit optional-mamba-pingpong-fix
 [ "$SPLITK" = 1 ] && emit optional-qsa-indexer-splitk
 [ "$BUDGET" = 1 ] && emit optional-recoverssm-budget
+[ "$WIDE" = 1 ] && emit optional-wide-verify
+if [ "$WIDE" = 1 ]; then
+  for v in QWEN_C_MC_TOPK QWEN_EP_HC_WIDE QWEN_I_WIDE_LMHEAD QWEN_J_WIDE_FP8LIN; do echo "-e $v=1 \\"; done
+fi
 echo "-e SGLANG_QSA_NVFP4_KV=1 \\"

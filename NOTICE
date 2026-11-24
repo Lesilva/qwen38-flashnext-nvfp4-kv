@@ -9,6 +9,11 @@ This repository contains modified copies of source files from:
   Pennyroyal / sglang-rtxpro6000 (https://github.com/jpezzulli/sglang-rtxpro6000)
   Copyright its contributors, licensed under the Apache License 2.0.
 
-Files under overlay/ are complete copies of Pennyroyal 2.5.3 sources with the
-changes shown in patches/. python/sglang/srt/layers/attention/qsa/nvfp4_kv.py
-and tests/test_nvfp4_kv.py are new files in this repository.
+Files under overlay/pennyroyal-<version>/ are complete copies of that Pennyroyal
+release's sources with the changes shown in patches/pennyroyal-<version>/.
+New files in this repository: python/sglang/srt/layers/attention/qsa/nvfp4_kv.py,
+python/sglang/kernels/ops/gemm/hillclimb_wide_gemm.py,
+python/sglang/srt/layers/hillclimb_hc_wide.py,
+python/sglang/kernels/ops/elementwise/mc_topk.py and mc_topk.cuh, and the tests/.
+mc_topk.cuh uses the same order-preserving float-to-uint32 key transform as
+SGLang's fast_topk.cuh.

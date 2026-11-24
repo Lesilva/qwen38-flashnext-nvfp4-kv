@@ -1,0 +1,1302 @@
+diff -ruN a/python/sglang/kernels/ops/elementwise/mc_topk.cuh b/python/sglang/kernels/ops/elementwise/mc_topk.cuh
+--- a/python/sglang/kernels/ops/elementwise/mc_topk.cuh	1969-12-31 19:00:00
++++ b/python/sglang/kernels/ops/elementwise/mc_topk.cuh	2026-11-24 16:02:51
+@@ -0,0 +1,697 @@
++// Multi-CTA exact top-k (k = 512) for QSA decode logits ("lever C").
++//
++// Same contract as sglang fast_topk(score, lengths, k, row_starts=None):
++//   row b selects the k largest of score[b, 0:lengths[b]); indices relative to
++//   the row start; slots beyond lengths[b] are -1; output order unspecified.
++//
++// One kernel, grid = (S, rows), BLOCK threads, cooperative launch (all CTAs
++// co-resident; S is capped by occupancy). Per row:
++//   * nact = min(S, ceil(L / chunk_target)) CTAs are active (derived from L on
++//     device, identical in every CTA of the row). Each converts its chunk to
++//     order-preserving uint32 keys, cached in registers (IPT per thread; a
++//     longer chunk re-reads the tail from memory on every pass).
++//   * nact == 1: exact radix select entirely in shared memory (digits 12/12/8).
++//   * nact  > 1: round 0 = 12-bit (key bits 31..20) histogram, smem per CTA,
++//     flushed into a per-row global histogram; per-row barrier. The last
++//     arriver finds the threshold digit d (largest with suffix >= k_rem) and
++//     publishes (d, k_rem, mode) together with the barrier generation in one
++//     64-bit word (release store; waiters poll with acquire loads). Modes:
++//       DIRECT   - threshold bin holds exactly k_rem keys, or last digit round
++//                  (all remaining keys equal): every CTA writes its selected
++//                  keys straight to the output.
++//       COMPACT  - threshold bin count <= CAP (= BLOCK*IPT): CTAs write keys
++//                  above the bin to the output and the bin's (key, idx) pairs
++//                  to a per-row compact buffer; the last CTA to exit finishes
++//                  the selection on the compact buffer locally (registers +
++//                  smem radix on the remaining bits).
++//       CONTINUE - bin too large (heavy ties / very narrow values): another
++//                  distributed round on the next digit (12 bits, then 8).
++//     Every path is exact; there is no lossy overflow case.
++//   * The last CTA to exit resets the per-row counters; histogram bins are
++//     zeroed by the CTA that read them. The workspace is all-zero between
++//     calls except the monotonic generation word.
++//   * L <= k: indices 0..L-1 then -1 (CTA 0).
++// Barrier timeout fallback. Spin waits are bounded (kSpinCap polls). Every
++// active CTA of a multi-CTA row ends by adding to the per-row exit word kDone:
++// +1 after a normal exit, +(kBail + 1) after leaving a barrier wait on timeout.
++// Waiters also give up within 1024 polls once kDone >= kBail (someone bailed).
++// The CTA whose add brings the count (low 16 bits) to nact is the last CTA of
++// the row alive in this call; every other CTA's workspace/output writes
++// happen-before its acq_rel add. If any CTA bailed (kDone >= kBail), it resets
++// the row's whole workspace state, bumps the sticky timeout counter
++// ws[:, kErrWord], and recomputes the row exactly with the single-CTA path over
++// [0, L) (overwriting all k output slots). So a timeout costs time but never
++// yields a wrong or out-of-range result, and the next call starts clean.
++// DBG=true builds a test-only variant with fault injection (Params::dbg).
++#include <sgl_kernel/tensor.h>
++#include <sgl_kernel/utils.h>
++
++#include <sgl_kernel/utils.cuh>
++
++#include <tvm/ffi/container/tensor.h>
++
++namespace sglang {
++namespace mc_topk_detail {
++
++constexpr int kNB = 4096;                       // 12-bit digit bins
++constexpr int kH0 = 0, kH1 = 4096, kH2 = 8192;  // per-round global histograms (u32 words)
++constexpr int kState = 8192 + 256;              // 16 state words
++// kErr: sticky count of recovered barrier timeouts (never cleared by the kernel).
++// kDone: exit word (count in bits 0..15, kBail per bailed CTA above).
++constexpr int kArr = 0, kGen = 2 /* u64, words 2..3 */, kSel = 4, kTie = 5, kErr = 6, kDone = 7;
++constexpr int kCompact = kState + 16;  // keys[kCapMax], then idx[kCapMax]
++constexpr int kCapMax = 8192;
++constexpr int kRowWords = kCompact + 2 * kCapMax;
++constexpr int kErrWord = kState + kErr;
++constexpr uint32_t kSpinCap = 1u << 22;
++constexpr uint32_t kBail = 1u << 16;
++constexpr uint32_t kDirect = 0, kCompactMode = 1, kContinue = 2;
++constexpr int kTraceSlots = 10;
++
++struct Params {
++  const float* __restrict__ input;
++  const int32_t* __restrict__ lengths;
++  int32_t* __restrict__ indices;
++  uint32_t* __restrict__ ws;
++  int64_t stride;
++  int32_t cols;
++  int32_t chunk_target;
++  unsigned long long* trace;  // optional [rows, gridDim.x, kTraceSlots] globaltimer stamps (debug)
++  // DBG builds only (test fault injection), int64[16] in device memory, read every call:
++  //  [0] row to perturb (-1 = off)  [1] CTA to delay  [2] where: 0 = before key load,
++  //  1 = before the round-0 arrive, 2 = before the round-1 arrive  [3] delay ns
++  //  (0 = until some CTA of the row bailed, max 20 s)  [4] spin cap override (0 = kSpinCap)
++  //  [8] CTA the override applies to (-1 = all CTAs of the row)
++  //  outputs: [5] max ns spent in a timed-out wait  [6] polls of the last timed-out wait
++  //           [7] number of CTA timeouts
++  long long* dbg;
++};
++
++__device__ __forceinline__ unsigned long long globaltimer() {
++  unsigned long long t;
++  asm volatile("mov.u64 %0, %globaltimer;" : "=l"(t));
++  return t;
++}
++__device__ __forceinline__ uint32_t key_of(float x) {
++  const uint32_t bits = __float_as_uint(x);
++  return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
++}
++__device__ __forceinline__ unsigned long long ld_acquire64(const unsigned long long* p) {
++  unsigned long long v;
++  asm volatile("ld.acquire.gpu.global.u64 %0, [%1];" : "=l"(v) : "l"(p) : "memory");
++  return v;
++}
++__device__ __forceinline__ unsigned long long ld_relaxed64(const unsigned long long* p) {
++  unsigned long long v;
++  asm volatile("ld.relaxed.gpu.global.u64 %0, [%1];" : "=l"(v) : "l"(p) : "memory");
++  return v;
++}
++__device__ __forceinline__ uint32_t ld_relaxed(const uint32_t* p) {
++  uint32_t v;
++  asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
++  return v;
++}
++__device__ __forceinline__ void st_release64(unsigned long long* p, unsigned long long v) {
++  asm volatile("st.release.gpu.global.u64 [%0], %1;" ::"l"(p), "l"(v) : "memory");
++}
++__device__ __forceinline__ void st_relaxed(uint32_t* p, uint32_t v) {
++  asm volatile("st.relaxed.gpu.global.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
++}
++__device__ __forceinline__ uint32_t atom_add_acq_rel(uint32_t* p, uint32_t v) {
++  uint32_t old;
++  asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;" : "=r"(old) : "l"(p), "r"(v) : "memory");
++  return old;
++}
++
++__device__ __forceinline__ void round_digit(int r, int& shift, uint32_t& dmask) {
++  shift = r == 0 ? 20 : (r == 1 ? 8 : 0);
++  dmask = r < 2 ? uint32_t(kNB - 1) : 255u;
++}
++
++// Histogram add with a fast path for warps whose keys mostly share one bin.
++__device__ __forceinline__ void hist_add(uint32_t* h, bool active, uint32_t bin) {
++  const int lane = threadIdx.x & 31;
++  const uint32_t b0 = __shfl_sync(0xffffffffu, bin, 0);
++  const bool a0 = __shfl_sync(0xffffffffu, active, 0);
++  const unsigned m = __ballot_sync(0xffffffffu, active && a0 && bin == b0);
++  if (lane == 0 && m) atomicAdd(h + b0, static_cast<uint32_t>(__popc(m)));
++  if (active && !((m >> lane) & 1u)) atomicAdd(h + bin, 1u);
++}
++
++// Block-wide threshold search over hist[0:NB): largest digit d with
++// suffix(d) >= k. Writes s_res = {d, k - suffix(d+1), mode}: DIRECT if the bin
++// holds exactly the remaining k (or last round), else COMPACT if its count
++// <= cap, else CONTINUE. Non-zero bins are zeroed if `zero`.
++// Layout: warp w owns bins [w*ROWS*32, (w+1)*ROWS*32), lane l of row i holds
++// bin base + i*32 + l (conflict-free smem / coalesced global accesses).
++template <int NB, int BLOCK, bool kGlobal>
++__device__ __forceinline__ void find_threshold(
++    uint32_t* hist, uint32_t k, bool last_round, uint32_t cap, uint32_t* s_scan, uint32_t* s_res, bool zero) {
++  constexpr int NW = BLOCK / 32;
++  constexpr int ROWS = NB >= BLOCK ? NB / BLOCK : 1;
++  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
++  const int base = warp * ROWS * 32;
++  uint32_t v[ROWS];
++  uint32_t lsum = 0;
++#pragma unroll
++  for (int i = 0; i < ROWS; ++i) {
++    const int b = base + i * 32 + lane;
++    uint32_t x = 0;
++    if (b < NB) x = kGlobal ? __ldcg(hist + b) : hist[b];
++    v[i] = x;
++    lsum += x;
++  }
++  uint32_t wsum = lsum;
++#pragma unroll
++  for (int o = 16; o > 0; o >>= 1) wsum += __shfl_xor_sync(0xffffffffu, wsum, o);
++  if (lane == 0) s_scan[warp] = wsum;
++  __syncthreads();
++  uint32_t above = 0;
++#pragma unroll
++  for (int w = 0; w < NW; ++w)
++    if (w > warp) above += s_scan[w];
++  if (above < k && k <= above + wsum) {  // warp-uniform: the crossing warp
++    uint32_t acc = above, acc_star = 0;
++    int istar = -1;
++#pragma unroll
++    for (int i = ROWS - 1; i >= 0; --i) {
++      uint32_t rs = v[i];
++#pragma unroll
++      for (int o = 16; o > 0; o >>= 1) rs += __shfl_xor_sync(0xffffffffu, rs, o);
++      if (istar < 0 && acc + rs >= k) {
++        istar = i;
++        acc_star = acc;
++      }
++      acc += rs;
++    }
++    uint32_t xv = 0;
++#pragma unroll
++    for (int i = 0; i < ROWS; ++i)
++      if (i == istar) xv = v[i];
++    uint32_t incl = xv;  // inclusive suffix over lanes (higher lane = higher bin)
++#pragma unroll
++    for (int o = 1; o < 32; o <<= 1) {
++      const uint32_t y = __shfl_down_sync(0xffffffffu, incl, o);
++      if (lane + o < 32) incl += y;
++    }
++    const uint32_t excl = incl - xv;
++    if (acc_star + excl < k && k <= acc_star + incl) {
++      const uint32_t krem = k - (acc_star + excl);
++      s_res[0] = base + istar * 32 + lane;
++      s_res[1] = krem;
++      s_res[2] = (xv == krem || last_round) ? kDirect : (xv <= cap ? kCompactMode : kContinue);
++    }
++  }
++  if (zero) {
++#pragma unroll
++    for (int i = 0; i < ROWS; ++i) {
++      const int b = base + i * 32 + lane;
++      if (b < NB && v[i] != 0) hist[b] = 0;
++    }
++  }
++}
++
++// Local (single-CTA) exact selection rounds over the elements visited by
++// `for_each`, starting at digit round r. Updates lo/amask/krem in place.
++template <int BLOCK, typename ForEach>
++__device__ __forceinline__ void local_select(
++    ForEach&& for_each, uint32_t* s_hist, uint32_t* s_scan, uint32_t* s_res, uint32_t& lo, uint32_t& amask,
++    uint32_t& krem, int r) {
++#pragma unroll 1
++  for (; r < 3; ++r) {
++    int shift;
++    uint32_t dmask;
++    round_digit(r, shift, dmask);
++    for_each([&](uint32_t key, int, bool valid) {
++      hist_add(s_hist, valid && (key & amask) == lo, (key >> shift) & dmask);
++    });
++    __syncthreads();
++    if (r < 2)
++      find_threshold<kNB, BLOCK, false>(s_hist, krem, false, 0u, s_scan, s_res, true);
++    else
++      find_threshold<256, BLOCK, false>(s_hist, krem, true, 0u, s_scan, s_res, true);
++    __syncthreads();
++    lo |= s_res[0] << shift;
++    krem = s_res[1];
++    amask |= dmask << shift;
++    const uint32_t mode = s_res[2];
++    __syncthreads();  // s_res / s_scan reused next round
++    if (mode == kDirect) break;
++  }
++}
++
++// Two-pass block collection (one counter reservation per CTA, no per-warp
++// atomic round trips). Keys above the active range {key : (key & amask) == lo}
++// are always selected -> out[cnt[0]++]. Keys inside it ("ties"/candidates):
++//   kCompactOut = false: fill the remaining krem slots, out[n_above + cnt[1]++]
++//                        (extra ties beyond krem are dropped: any is valid);
++//   kCompactOut = true : appended to the compact buffer (ckeys, cidx)[cnt[1]++].
++// `cnt` may be shared or global memory. s_w needs 4 * (BLOCK / 32) words.
++template <int kTopK, int BLOCK, bool kCompactOut, typename ForEach>
++__device__ __forceinline__ void collect(
++    ForEach&& for_each, uint32_t lo, uint32_t amask, uint32_t krem, uint32_t* cnt, int32_t* out, int32_t* ckeys,
++    int32_t* cidx, uint32_t* s_w) {
++  constexpr int NW = BLOCK / 32;
++  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
++  const uint32_t hi_incl = lo | ~amask;
++  const uint32_t n_above = kTopK - krem;
++  const unsigned lt_mask = (1u << lane) - 1u;
++  uint32_t nsel = 0, ntie = 0;
++  for_each([&](uint32_t key, int, bool valid) {
++    const bool is_sel = valid && key > hi_incl;
++    const bool is_tie = valid && !is_sel && (key & amask) == lo;
++    nsel += __popc(__ballot_sync(0xffffffffu, is_sel));
++    ntie += __popc(__ballot_sync(0xffffffffu, is_tie));
++  });
++  if (lane == 0) {
++    s_w[warp] = nsel;
++    s_w[NW + warp] = ntie;
++  }
++  __syncthreads();
++  if (tid == 0) {
++    uint32_t ts = 0, tt = 0;
++    for (int w = 0; w < NW; ++w) {
++      const uint32_t a = s_w[w], b = s_w[NW + w];
++      s_w[2 * NW + w] = ts;
++      s_w[3 * NW + w] = tt;
++      ts += a;
++      tt += b;
++    }
++    uint32_t bs = 0, bt = 0;
++    if (ts) bs = atomicAdd(cnt, ts);
++    if (tt) bt = atomicAdd(cnt + 1, tt);
++    for (int w = 0; w < NW; ++w) {
++      s_w[2 * NW + w] += bs;
++      s_w[3 * NW + w] += bt;
++    }
++  }
++  __syncthreads();
++  uint32_t osel = s_w[2 * NW + warp], otie = s_w[3 * NW + warp];
++  for_each([&](uint32_t key, int e, bool valid) {
++    const bool is_sel = valid && key > hi_incl;
++    const bool is_tie = valid && !is_sel && (key & amask) == lo;
++    const unsigned ms = __ballot_sync(0xffffffffu, is_sel);
++    const unsigned mt = __ballot_sync(0xffffffffu, is_tie);
++    if (is_sel) out[osel + __popc(ms & lt_mask)] = e;
++    if (is_tie) {
++      const uint32_t pos = otie + __popc(mt & lt_mask);
++      if constexpr (kCompactOut) {
++        ckeys[pos] = static_cast<int32_t>(key);
++        cidx[pos] = e;
++      } else {
++        if (pos < krem) out[n_above + pos] = e;
++      }
++    }
++    osel += __popc(ms);
++    otie += __popc(mt);
++  });
++}
++
++template <int kTopK, int BLOCK, int IPT, bool DBG>
++__global__ __launch_bounds__(BLOCK, (BLOCK >= 512 ? 2 : 1)) void mc_topk_kernel(const Params __grid_constant__ p) {
++  constexpr uint32_t CAP = BLOCK * IPT;
++  static_assert(CAP <= kCapMax, "compact capacity");
++  __shared__ uint32_t s_hist[kNB];
++  __shared__ uint32_t s_scan[BLOCK / 32];
++  __shared__ uint32_t s_res[4];
++  __shared__ uint32_t s_cnt[2];
++  __shared__ uint32_t s_w[4 * (BLOCK / 32)];
++  __shared__ unsigned long long s_word;
++  __shared__ int s_flag;
++
++  const int tid = threadIdx.x;
++  const int row = blockIdx.y;
++  const int cta = blockIdx.x;
++  int L = p.lengths[row];
++  L = L < 0 ? 0 : (L > p.cols ? p.cols : L);
++  int32_t* __restrict__ out = p.indices + static_cast<int64_t>(row) * kTopK;
++  auto trace = [&](int slot) {
++    if (p.trace != nullptr && tid == 0)
++      p.trace[(static_cast<int64_t>(row) * gridDim.x + cta) * kTraceSlots + slot] = globaltimer();
++  };
++
++  if (L <= kTopK) {
++    if (cta == 0)
++      for (int i = tid; i < kTopK; i += BLOCK) out[i] = i < L ? i : -1;
++    return;
++  }
++  int nact = (L + p.chunk_target - 1) / p.chunk_target;
++  if (nact > static_cast<int>(gridDim.x)) nact = gridDim.x;
++  if (cta >= nact) return;
++  trace(0);
++  const bool single = nact == 1;
++  const int chunk = (L + nact - 1) / nact;
++  int start = cta * chunk;
++  int end = min(L, start + chunk);
++  const float* __restrict__ x = p.input + static_cast<int64_t>(row) * p.stride;
++  uint32_t* wrow = p.ws + static_cast<int64_t>(row) * kRowWords;
++  uint32_t* st = wrow + kState;
++  unsigned long long* gen_word = reinterpret_cast<unsigned long long*>(st + kGen);
++
++  // ---- test-only fault injection (compiled out unless DBG) ----
++  [[maybe_unused]] bool dbg_hit = false;
++  uint32_t spin_cap = kSpinCap;
++  if constexpr (DBG) {
++    if (p.dbg != nullptr && p.dbg[0] == row) {
++      dbg_hit = true;
++      if (p.dbg[4] > 0 && (p.dbg[8] < 0 || p.dbg[8] == cta)) spin_cap = static_cast<uint32_t>(p.dbg[4]);
++    }
++  }
++  [[maybe_unused]] auto dbg_wait = [&](int where) {
++    if constexpr (DBG) {
++      if (dbg_hit && !single && p.dbg[1] == cta && p.dbg[2] == where) {
++        if (tid == 0) {
++          const unsigned long long t0 = globaltimer();
++          const long long delay = p.dbg[3];
++          for (;;) {
++            const unsigned long long t = globaltimer() - t0;
++            if (delay > 0 ? t >= static_cast<unsigned long long>(delay)
++                          : (ld_relaxed(st + kDone) >= kBail || t > 20000000000ull))
++              break;
++            __nanosleep(2000);
++          }
++        }
++        __syncthreads();
++      }
++    }
++  };
++  dbg_wait(0);
++
++  for (int b = tid; b < kNB; b += BLOCK) s_hist[b] = 0;
++  if (tid < 2) s_cnt[tid] = 0;
++  // Generation before this call's first barrier (cannot advance until this CTA arrives).
++  uint32_t g = single ? 0u : static_cast<uint32_t>(ld_relaxed64(gen_word));
++
++  uint32_t keys[IPT];
++  auto load_keys = [&]() {
++#pragma unroll
++    for (int j = 0; j < IPT; ++j) {
++      const int e = start + j * BLOCK + tid;
++      keys[j] = e < end ? key_of(__ldg(x + e)) : 0u;
++    }
++  };
++  load_keys();
++  __syncthreads();
++  trace(1);
++
++  auto for_each = [&](auto&& fn) {
++#pragma unroll
++    for (int j = 0; j < IPT; ++j) {
++      const int e = start + j * BLOCK + tid;
++      fn(keys[j], e, e < end);
++    }
++    // Tail beyond the register cache (only when the occupancy cap forces long
++    // chunks, or in the timeout recovery): batched loads so several are in flight per thread.
++    constexpr int U = 4;
++#pragma unroll 1
++    for (int base = start + IPT * BLOCK; base < end; base += U * BLOCK) {
++      uint32_t kk[U];
++#pragma unroll
++      for (int u = 0; u < U; ++u) {
++        const int e = base + u * BLOCK + tid;
++        kk[u] = e < end ? key_of(__ldg(x + e)) : 0u;
++      }
++#pragma unroll
++      for (int u = 0; u < U; ++u) {
++        const int e = base + u * BLOCK + tid;
++        fn(kk[u], e, e < end);
++      }
++    }
++  };
++
++  uint32_t lo = 0, amask = 0, krem = kTopK;
++  if (single) {  // single-CTA exact selection over [start, end)
++    local_select<BLOCK>(for_each, s_hist, s_scan, s_res, lo, amask, krem, 0);
++    collect<kTopK, BLOCK, false>(for_each, lo, amask, krem, s_cnt, out, nullptr, nullptr, s_w);
++    trace(8);
++    return;
++  }
++  {
++    // ---- distributed rounds ----
++    uint32_t mode = kContinue;
++    bool bailed = false;
++    int r = 0;
++#pragma unroll 1
++    for (; r < 3 && mode == kContinue; ++r) {
++      int shift;
++      uint32_t dmask;
++      round_digit(r, shift, dmask);
++      const int nb = r < 2 ? kNB : 256;
++      uint32_t* ghist = wrow + (r == 0 ? kH0 : (r == 1 ? kH1 : kH2));
++      for_each([&](uint32_t key, int, bool valid) {
++        hist_add(s_hist, valid && (key & amask) == lo, (key >> shift) & dmask);
++      });
++      __syncthreads();
++      for (int b = tid; b < nb; b += BLOCK) {
++        const uint32_t v = s_hist[b];
++        if (v) {
++          atomicAdd(ghist + b, v);
++          s_hist[b] = 0;
++        }
++      }
++      __syncthreads();
++      trace(2 + 2 * r);
++      dbg_wait(1 + r);
++      if (tid == 0) {
++        const uint32_t a = atom_add_acq_rel(st + kArr, 1u);
++        s_flag = (a == static_cast<uint32_t>(nact - 1)) ? 1 : 0;
++      }
++      __syncthreads();
++      uint32_t d, mode_new, krem_new;
++      if (s_flag == 1) {
++        if (r < 2)
++          find_threshold<kNB, BLOCK, true>(ghist, krem, false, CAP, s_scan, s_res, false);
++        else
++          find_threshold<256, BLOCK, true>(ghist, krem, true, CAP, s_scan, s_res, false);
++        __syncthreads();
++        d = s_res[0];
++        krem_new = s_res[1];
++        mode_new = s_res[2];
++        if (tid == 0) {
++          st_relaxed(st + kArr, 0u);
++          const unsigned long long info = d | (krem_new << 12) | (mode_new << 22);
++          st_release64(gen_word, (info << 32) | static_cast<unsigned long long>(g + 1));
++        }
++        // Zero the bins just read (after the release; this round's buffer is not reused in this call).
++        for (int b = tid; b < nb; b += BLOCK) ghist[b] = 0;
++      } else {
++        if (tid == 0) {
++          uint32_t it = 0;
++          unsigned long long w;
++          int err = 0;
++          [[maybe_unused]] unsigned long long t_w0 = 0;
++          if constexpr (DBG) t_w0 = globaltimer();
++          while (static_cast<uint32_t>(w = ld_acquire64(gen_word)) == g) {
++            if (++it > spin_cap) {  // timeout: this CTA bails
++              err = 1;
++              if constexpr (DBG) {
++                if (p.dbg != nullptr) {
++                  atomicMax(reinterpret_cast<unsigned long long*>(p.dbg + 5), globaltimer() - t_w0);
++                  p.dbg[6] = it;
++                  atomicAdd(reinterpret_cast<unsigned long long*>(p.dbg + 7), 1ull);
++                }
++              }
++              break;
++            }
++            if ((it & 1023u) == 0 && ld_relaxed(st + kDone) >= kBail) {  // another CTA of the row bailed
++              err = 1;
++              break;
++            }
++          }
++          s_word = w;
++          s_flag = err ? -1 : 0;
++        }
++        __syncthreads();
++        if (s_flag < 0) {  // CTA-uniform; s_flag is next written after the exit barrier below
++          bailed = true;
++          break;
++        }
++        const uint32_t info = static_cast<uint32_t>(s_word >> 32);
++        d = info & 0xFFFu;
++        krem_new = (info >> 12) & 0x3FFu;
++        mode_new = (info >> 22) & 0x3u;
++      }
++      __syncthreads();  // s_res / s_word / s_flag reused
++      ++g;
++      lo |= d << shift;
++      krem = krem_new;
++      amask |= dmask << shift;
++      mode = mode_new;
++      trace(3 + 2 * r);
++    }
++
++    int32_t* ckeys = reinterpret_cast<int32_t*>(wrow + kCompact);
++    int32_t* cidx = ckeys + kCapMax;
++    if (!bailed) {
++      if (mode == kDirect)
++        collect<kTopK, BLOCK, false>(for_each, lo, amask, krem, st + kSel, out, nullptr, nullptr, s_w);
++      else  // kCompactMode
++        collect<kTopK, BLOCK, true>(for_each, lo, amask, krem, st + kSel, out, ckeys, cidx, s_w);
++    }
++
++    // ---- exit: the last CTA of the row finishes (COMPACT) or recovers (timeout) and resets ----
++    __syncthreads();
++    trace(8);
++    if (tid == 0) {
++      const uint32_t inc = bailed ? kBail + 1u : 1u;
++      const uint32_t a = atom_add_acq_rel(st + kDone, inc) + inc;
++      s_flag = ((a & (kBail - 1u)) == static_cast<uint32_t>(nact)) ? (a >= kBail ? 2 : 1) : 0;
++    }
++    __syncthreads();
++    const int last = s_flag;
++    if (last == 0) return;
++    if (last == 1) {
++      if (mode == kCompactMode) {
++        const int ncand = static_cast<int>(__ldcg(st + kTie));
++        uint32_t ck[IPT];
++        int ci[IPT];
++#pragma unroll
++        for (int j = 0; j < IPT; ++j) {
++          const int i = j * BLOCK + tid;
++          ck[j] = i < ncand ? static_cast<uint32_t>(__ldcg(ckeys + i)) : 0u;
++          ci[j] = i < ncand ? __ldcg(cidx + i) : -1;
++        }
++        auto for_each_cand = [&](auto&& fn) {
++#pragma unroll
++          for (int j = 0; j < IPT; ++j) fn(ck[j], ci[j], j * BLOCK + tid < ncand);
++        };
++        if (tid == 0) {
++          s_cnt[0] = kTopK - krem;  // keys above the compact range were already written
++          s_cnt[1] = 0;
++        }
++        __syncthreads();
++        local_select<BLOCK>(for_each_cand, s_hist, s_scan, s_res, lo, amask, krem, r);
++        collect<kTopK, BLOCK, false>(for_each_cand, lo, amask, krem, s_cnt, out, nullptr, nullptr, s_w);
++      }
++      if (tid == 0) {
++        st[kSel] = 0;
++        st[kTie] = 0;
++        st[kDone] = 0;
++      }
++      trace(9);
++      return;
++    }
++    // last == 2: some CTA of this row timed out. Every other CTA of the row has finished
++    // (its writes happen-before our acquire), so reset the row's whole workspace state and
++    // recompute the row exactly on this CTA (single-CTA path over [0, L)).
++    for (int b = tid; b < kState; b += BLOCK) wrow[b] = 0;  // histograms H0, H1, H2
++    for (int b = tid; b < kNB; b += BLOCK) s_hist[b] = 0;
++    if (tid == 0) {
++      st[kArr] = 0;
++      st[kSel] = 0;
++      st[kTie] = 0;
++      st[kDone] = 0;
++      atomicAdd(st + kErr, 1u);  // sticky diagnostic: recovered timeouts on this row
++      s_cnt[0] = 0;
++      s_cnt[1] = 0;
++    }
++    start = 0;
++    end = L;
++    load_keys();
++    lo = 0;
++    amask = 0;
++    krem = kTopK;
++    __syncthreads();
++    local_select<BLOCK>(for_each, s_hist, s_scan, s_res, lo, amask, krem, 0);
++    collect<kTopK, BLOCK, false>(for_each, lo, amask, krem, s_cnt, out, nullptr, nullptr, s_w);
++    trace(9);
++  }
++}
++
++namespace {
++int g_coop_cap = 0;
++}  // namespace
++
++}  // namespace mc_topk_detail
++
++template <int kTopK, int BLOCK, int IPT, bool DBG = false>
++struct McTopKKernel {
++  static constexpr auto kernel = mc_topk_detail::mc_topk_kernel<kTopK, BLOCK, IPT, DBG>;
++
++  // workspace: int32 [R >= B, kRowWords], zero-initialised once by the caller.
++  // trace: int64 tensor; used only if numel >= rows * S * kTraceSlots (debug).
++  // dbg: int64 tensor; used only in DBG builds and if numel >= 16 (fault injection, see Params).
++  // chunk_target <= 0 -> BLOCK * IPT. max_ctas_per_row <= 0 -> auto.
++  static void
++  run(const tvm::ffi::TensorView score,
++      const tvm::ffi::TensorView lengths,
++      const tvm::ffi::TensorView indices,
++      const tvm::ffi::TensorView workspace,
++      const tvm::ffi::TensorView trace,
++      const tvm::ffi::TensorView dbg,
++      int64_t chunk_target,
++      int64_t max_ctas_per_row,
++      int64_t cooperative) {
++    using namespace host;
++    auto B = SymbolicSize{"batch"};
++    auto Lc = SymbolicSize{"cols"};
++    auto S = SymbolicSize{"input_stride"};
++    auto R = SymbolicSize{"ws_rows"};
++    auto device = SymbolicDevice{};
++    device.set_options<kDLCUDA>();
++    TensorMatcher({B, Lc}).with_strides({S, 1}).with_dtype<fp32_t>().with_device(device).verify(score);
++    TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(lengths);
++    TensorMatcher({B, kTopK}).with_dtype<int32_t>().with_device(device).verify(indices);
++    TensorMatcher({R, mc_topk_detail::kRowWords}).with_dtype<int32_t>().with_device(device).verify(workspace);
++    const int64_t rows = B.unwrap();
++    RuntimeCheck(R.unwrap() >= rows, "mc_topk: workspace has too few rows");
++    if (rows == 0) return;
++
++    // Max co-resident CTAs. Internal linkage on purpose: a function-local static in this
++    // class template would be a vague-linkage symbol shared by every JIT .so that
++    // instantiates the same template (different kernels -> wrong cap).
++    int& s_cap = mc_topk_detail::g_coop_cap;
++    if (s_cap == 0) {
++      int dev = 0, sms = 0, occ = 0;
++      RuntimeDeviceCheck(cudaGetDevice(&dev));
++      RuntimeDeviceCheck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
++      RuntimeDeviceCheck(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, kernel, BLOCK, 0));
++      s_cap = sms * occ;
++    }
++    const int64_t ct = chunk_target > 0 ? chunk_target : int64_t(BLOCK) * IPT;
++    const int64_t cols = Lc.unwrap();
++    int64_t per_row = (cols + ct - 1) / ct;
++    int64_t cap_row = s_cap / rows;
++    if (max_ctas_per_row > 0 && cap_row > max_ctas_per_row) cap_row = max_ctas_per_row;
++    if (per_row > cap_row) per_row = cap_row;
++    if (per_row < 1) per_row = 1;
++
++    auto params = mc_topk_detail::Params{
++        .input = static_cast<const float*>(score.data_ptr()),
++        .lengths = static_cast<const int32_t*>(lengths.data_ptr()),
++        .indices = static_cast<int32_t*>(indices.data_ptr()),
++        .ws = static_cast<uint32_t*>(workspace.data_ptr()),
++        .stride = S.unwrap(),
++        .cols = static_cast<int32_t>(cols),
++        .chunk_target = static_cast<int32_t>(ct),
++        .trace = nullptr,
++        .dbg = nullptr,
++    };
++    {
++      int64_t n = 1;
++      for (int i = 0; i < trace.ndim(); ++i) n *= trace.size(i);
++      if (n >= rows * per_row * mc_topk_detail::kTraceSlots)
++        params.trace = static_cast<unsigned long long*>(trace.data_ptr());
++    }
++    if constexpr (DBG) {
++      int64_t n = 1;
++      for (int i = 0; i < dbg.ndim(); ++i) n *= dbg.size(i);
++      if (n >= 16) params.dbg = static_cast<long long*>(dbg.data_ptr());
++    }
++    cudaLaunchConfig_t cfg = {};
++    cfg.gridDim = dim3(static_cast<unsigned>(per_row), static_cast<unsigned>(rows));
++    cfg.blockDim = dim3(BLOCK);
++    cfg.dynamicSmemBytes = 0;
++    cfg.stream = LaunchKernel::resolve_device(device.unwrap());
++    cudaLaunchAttribute attr[1];
++    if (cooperative && per_row > 1) {
++      attr[0].id = cudaLaunchAttributeCooperative;
++      attr[0].val.cooperative = 1;
++      cfg.attrs = attr;
++      cfg.numAttrs = 1;
++    }
++    RuntimeDeviceCheck(::cudaLaunchKernelEx(&cfg, kernel, params));
++  }
++};
++
++}  // namespace sglang
+diff -ruN a/python/sglang/kernels/ops/elementwise/mc_topk.py b/python/sglang/kernels/ops/elementwise/mc_topk.py
+--- a/python/sglang/kernels/ops/elementwise/mc_topk.py	1969-12-31 19:00:00
++++ b/python/sglang/kernels/ops/elementwise/mc_topk.py	2026-11-24 16:02:51
+@@ -0,0 +1,131 @@
++"""Multi-CTA exact top-512 (drop-in for sglang fast_topk(score, lengths, 512, row_starts=None)).
++
++Build: JIT through sglang.kernels.jit.utils.load_jit (absolute source path).
++Workspace: one persistent, zero-initialised int32 [rows_cap, ROW_WORDS] buffer per device,
++self-cleaning between calls. Call `mc_topk_prepare(max_rows, device)` before CUDA-graph
++capture; growing it during capture raises. Calls sharing a workspace must be serialised on
++one stream (they are in the decode path).
++
++Barrier timeout: the kernel recovers by itself inside the same call (the last CTA of the row
++resets the row's workspace and recomputes it exactly on one CTA); `mc_topk_timeout_count()`
++reports how many such recoveries ever happened (sticky, host sync).
++"""
++from __future__ import annotations
++
++import os
++
++import torch
++
++from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
++
++_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mc_topk.cuh")
++STATE = 8192 + 256  # must match mc_topk.cuh kState
++ROW_WORDS = STATE + 16 + 2 * 8192  # kRowWords
++ERR_WORD = STATE + 6  # kErrWord: sticky count of recovered barrier timeouts
++DONE_WORD = STATE + 7  # kDone: per-call exit word (zero between calls)
++GEN_WORDS = (STATE + 2, STATE + 3)
++DEFAULT_BLOCK = int(os.environ.get("MC_TOPK_BLOCK", "512"))
++DEFAULT_IPT = int(os.environ.get("MC_TOPK_IPT", "8"))
++
++
++@cache_once
++def _module(topk: int, block: int, ipt: int, src: str = _SRC, debug: bool = False):
++    args = make_cpp_args(topk, block, ipt, debug)
++    tag = os.path.splitext(os.path.basename(src))[0]
++    return load_jit(
++        tag,
++        *args,
++        cuda_files=[src],
++        cuda_wrappers=[("mc_topk", f"McTopKKernel<{args}>::run")],
++    )
++
++
++_WS: dict = {}
++_WS_RETIRED: list = []  # outgrown workspaces: kept alive, captured graphs may still reference them
++_DUMMY: dict = {}
++
++
++def _dev_key(device) -> tuple:
++    device = torch.device(device if device is not None else "cuda")
++    idx = device.index if device.index is not None else torch.cuda.current_device()
++    return device.type, idx
++
++
++def mc_topk_prepare(max_rows: int, device=None, block: int = DEFAULT_BLOCK, ipt: int = DEFAULT_IPT) -> torch.Tensor:
++    """Allocate/grow the zeroed workspace, the dummy trace tensor and JIT-load the module.
++    Call before CUDA-graph capture with the largest row count that will be captured. Growing
++    keeps the old buffer alive (graphs captured earlier keep pointing at it)."""
++    key = _dev_key(device)
++    dev = torch.device(key[0], key[1])
++    ws = _WS.get(key)
++    if ws is None or ws.shape[0] < max_rows:
++        if torch.cuda.is_current_stream_capturing():
++            raise RuntimeError("mc_topk workspace must be prepared (mc_topk_prepare) before CUDA graph capture")
++        n = 16
++        while n < max_rows:
++            n *= 2
++        if ws is not None:
++            _WS_RETIRED.append(ws)
++        ws = torch.zeros((n, ROW_WORDS), dtype=torch.int32, device=dev)
++        _WS[key] = ws
++    if key not in _DUMMY:
++        if torch.cuda.is_current_stream_capturing():
++            raise RuntimeError("mc_topk_prepare must run before CUDA graph capture")
++        _DUMMY[key] = torch.zeros(1, dtype=torch.int64, device=dev)
++        _module(512, block, ipt)
++    return ws
++
++
++def mc_topk(
++    score: torch.Tensor,
++    lengths: torch.Tensor,
++    topk: int = 512,
++    *,
++    chunk_target: int = 0,
++    max_ctas_per_row: int = 0,
++    cooperative: bool = True,
++    block: int = DEFAULT_BLOCK,
++    ipt: int = DEFAULT_IPT,
++    workspace: torch.Tensor | None = None,
++    trace: torch.Tensor | None = None,
++    src: str | None = None,
++    debug_ctl: torch.Tensor | None = None,
++) -> torch.Tensor:
++    """score fp32 [B, W] (unit stride in dim 1), lengths int32 [B] -> int32 [B, topk].
++
++    debug_ctl (tests only): int64 [16] device tensor; selects the DBG build with fault
++    injection (layout in mc_topk.cuh Params::dbg). Never pass it in production."""
++    if topk != 512:
++        raise RuntimeError("mc_topk only built for topk=512")
++    B = score.shape[0]
++    ws = workspace if workspace is not None else mc_topk_prepare(B, score.device)
++    out = score.new_empty((B, topk), dtype=torch.int32)
++    dummy = _DUMMY[_dev_key(score.device)]
++    if trace is None:
++        trace = dummy
++    debug = debug_ctl is not None
++    _module(topk, block, ipt, src or _SRC, debug).mc_topk(
++        score, lengths, out, ws, trace, debug_ctl if debug else dummy,
++        int(chunk_target), int(max_ctas_per_row), int(bool(cooperative)),
++    )
++    return out
++
++
++def mc_topk_error_flag(device=None) -> int:
++    """Number of workspace rows on which a barrier timeout ever happened (sticky; each was
++    recovered in-kernel with an exact result). Host sync; diagnostics only."""
++    ws = mc_topk_prepare(1, device)
++    return int((ws[:, ERR_WORD] != 0).sum().item())
++
++
++def mc_topk_timeout_count(device=None) -> int:
++    """Total number of (row, call) barrier timeouts ever recovered (sticky). Host sync."""
++    ws = mc_topk_prepare(1, device)
++    return int(ws[:, ERR_WORD].long().sum().item())
++
++
++def mc_topk_reset_workspace(device=None) -> None:
++    """Re-zero the workspace in place (not needed after a barrier timeout any more; also
++    clears the sticky timeout counters). Not during capture; the address stays the same so
++    captured graphs remain valid."""
++    mc_topk_prepare(1, device).zero_()
+diff -ruN a/python/sglang/kernels/ops/gemm/hillclimb_wide_gemm.py b/python/sglang/kernels/ops/gemm/hillclimb_wide_gemm.py
+--- a/python/sglang/kernels/ops/gemm/hillclimb_wide_gemm.py	1969-12-31 19:00:00
++++ b/python/sglang/kernels/ops/gemm/hillclimb_wide_gemm.py	2026-11-24 16:02:51
+@@ -0,0 +1,219 @@
++"""Local patch (2026-11-24, levers I and J): rowwise-FP8 W8A16 skinny GEMM for 16 < M <= 64 on SM120.
++
++Used by the dense online-FP8 linears (lever J, QWEN_J_WIDE_FP8LIN=1, qwen4_exp.py) and the rowwise-FP8
++lm_head / FR-Spec hot head (lever I, QWEN_I_WIDE_LMHEAD=1, sm120_online_fp8.py).
++
++    y[M, N] = bf16( (x[M, K] @ W[N, K]^T) * scale[N] ),  W fp8 e4m3 [N, K] K-contiguous (the resident
++    online-FP8 weight exactly as Penny stores it: layer.weight is the [K, N] view, .t() gives [N, K]).
++
++Penny's ``w8a16_gemv`` stops at M = 16. Above that, ``Fp8LinearMethod.apply`` falls back to the CUTLASS
++W8A8 path with per-token activation quantization, which costs ~40 us per call on SM120 whatever the
++shape (2560x6144 o_proj: 7.7 us at M=16 -> 39.8 us at M=20). NEXTN verify runs at M = 4*bs, so every
++batch of 5..16 requests pays that on every dense linear (~3 ms per step).
++
++Two kernel families, chosen per (N, K, M bucket) by a measured table:
++  * "tile": an M-tiled kernel (one CTA per (M tile, N block), M tile fastest so CTAs sharing a weight
++    tile run back to back and hit L2). No split-K, no scratch, nothing to prealloc, no stream hazard.
++  * "splitk": Penny's own ``_w8a16_gemv_kernel`` (imported, unmodified) launched with M_PAD 32/64 and a
++    private split-K scratch sized for M_PAD 64 (two slots, honouring Penny's ``scratch_slot`` choice,
++    because the shared expert may run on an alternate stream). Must be prealloc'd before graph capture.
++Numerics in both: bf16 operands, fp32 accumulation, acc * scale[n] rounded to bf16 -- Penny's epilogue.
++"""
++
++import functools
++import os
++
++import torch
++import triton
++import triton.language as tl
++
++MIN_M = 17
++MAX_M = 64
++
++
++def _flag(name):
++    return os.environ.get(name, "0").lower() in ("1", "true", "yes", "on")
++
++
++def j_enabled() -> bool:
++    return _flag("QWEN_J_WIDE_FP8LIN")
++
++
++def i_enabled() -> bool:
++    return _flag("QWEN_I_WIDE_LMHEAD")
++
++
++# ----------------------------------------------------------------------------------------------
++# family "tile"
++# ----------------------------------------------------------------------------------------------
++@triton.jit
++def _w8a16_mtile_kernel(
++    x_ptr, w_ptr, s_ptr, y_ptr, M, N, K, stride_xm, stride_wn, stride_ym,
++    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, EVEN_K: tl.constexpr,
++):
++    pid_m = tl.program_id(0)
++    pid_n = tl.program_id(1)
++    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
++    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++    offs_k = tl.arange(0, BLOCK_K)
++    m_mask = offs_m < M
++    n_mask = offs_n < N
++    rows = tl.minimum(offs_n, N - 1)
++    w_rows = w_ptr + rows.to(tl.int64)[:, None] * stride_wn
++    x_rows = x_ptr + offs_m[:, None] * stride_xm
++    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
++    for k0 in range(0, K, BLOCK_K):
++        kk = k0 + offs_k
++        if EVEN_K:
++            w = tl.load(w_rows + kk[None, :])
++            x = tl.load(x_rows + kk[None, :], mask=m_mask[:, None], other=0.0)
++        else:
++            k_mask = kk < K
++            w = tl.load(w_rows + kk[None, :], mask=k_mask[None, :], other=0.0)
++            x = tl.load(x_rows + kk[None, :], mask=m_mask[:, None] & k_mask[None, :], other=0.0)
++        acc += tl.dot(x, tl.trans(w.to(tl.bfloat16)), out_dtype=tl.float32)
++    scale = tl.load(s_ptr + offs_n, mask=n_mask, other=0.0)
++    out = (acc * scale[None, :]).to(tl.bfloat16)
++    tl.store(y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :], out,
++             mask=m_mask[:, None] & n_mask[None, :])
++
++
++def _launch_tile(x, w, s, y, cfg):
++    _, bm, bn, bk, warps, stages = cfg
++    M, K = x.shape
++    N = w.shape[0]
++    grid = (triton.cdiv(M, bm), triton.cdiv(N, bn))
++    _w8a16_mtile_kernel[grid](
++        x, w, s, y, M, N, K, x.stride(0), w.stride(0), y.stride(0),
++        BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, EVEN_K=K % bk == 0, num_warps=warps, num_stages=stages,
++    )
++
++
++# ----------------------------------------------------------------------------------------------
++# family "splitk": Penny's kernel, private scratch
++# ----------------------------------------------------------------------------------------------
++_WS_FLOATS = 1 << 22  # 16 MiB per slot
++_WS_COUNTERS = 4096
++_WS = {}
++
++
++def _scratch(device, slot):
++    key = (device, slot)
++    ws = _WS.get(key)
++    if ws is None:
++        if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
++            raise RuntimeError("w8a16_wide split-K scratch must be prealloc'd before CUDA graph capture")
++        ws = (torch.empty(_WS_FLOATS, dtype=torch.float32, device=device),
++              torch.zeros(_WS_COUNTERS, dtype=torch.int32, device=device))
++        _WS[key] = ws
++    return ws
++
++
++def prealloc(device) -> None:
++    from sglang.srt.layers.quantization import w8a16_gemv as g
++
++    for slot in range(g._N_SLOTS):
++        _scratch(device, slot)
++
++
++def _splitk_fits(N, cfg):
++    _, bn, bk, splits, warps, stages, m_pad = cfg
++    nb = triton.cdiv(N, bn)
++    return splits == 1 or (nb <= _WS_COUNTERS and nb * splits * m_pad * bn <= _WS_FLOATS)
++
++
++def _launch_splitk(x, w, s, y, cfg):
++    from sglang.kernels.triton_pdl import PDL
++    from sglang.srt.layers.quantization import w8a16_gemv as g
++
++    _, bn, bk, splits, warps, stages, m_pad = cfg
++    M, K = x.shape
++    N = w.shape[0]
++    assert M <= m_pad and _splitk_fits(N, cfg)
++    ws, cnt = _scratch(x.device, g._SLOT)
++    g._w8a16_gemv_kernel[(triton.cdiv(N, bn), splits)](
++        x, w, s, y, y, ws, cnt, x, x, M, N, K,
++        x.stride(0), x.stride(1), w.stride(0), w.stride(1), y.stride(0), y.stride(1), y.stride(0),
++        x.stride(0), 0.0,
++        SPLIT_N=0, PER_CHANNEL=True, BLOCK_N=bn, BLOCK_K=bk, M_PAD=m_pad, SPLITS=splits,
++        EVEN_K=K % bk == 0, W_KN=False, USE_DOT=True, USE_PDL=PDL, SEG_NB0=0, NORM_G=0,
++        NORM_SIGMOID=False, launch_pdl=PDL, num_warps=warps, num_stages=stages,
++    )
++
++
++# ----------------------------------------------------------------------------------------------
++# plans
++# ----------------------------------------------------------------------------------------------
++def m_bucket(M: int) -> int:
++    return 32 if M <= 32 else (48 if M <= 48 else 64)
++
++
++# (N, K, M bucket) -> cfg; filled from j_sweep.py results (RTX PRO 6000, SM120, 188 SMs, cold L2).
++# tile cfg:   ("tile", BLOCK_M, BLOCK_N, BLOCK_K, warps, stages)
++# splitk cfg: ("splitk", BLOCK_N, BLOCK_K, SPLITS, warps, stages, M_PAD)
++TUNED = {
++    # lever I (d_head/lever_i sweep, 98304-row slice, 144 MiB L2 flush): target head and FR-Spec hot head
++    (248320, 2560, 32): ("tile", 16, 64, 256, 4, 3),
++    (248320, 2560, 48): ("tile", 16, 64, 256, 4, 3),
++    (248320, 2560, 64): ("tile", 64, 128, 128, 8, 3),
++    (98304, 2560, 32): ("tile", 16, 64, 256, 4, 3),
++    (98304, 2560, 48): ("tile", 16, 64, 256, 4, 3),
++    (98304, 2560, 64): ("tile", 64, 128, 128, 8, 3),
++    # lever J (jlin/sweep-<shape>-<32|64>.json, 2026-11-24; 48-row calls use the 64 entry). Same-config
++    # run-to-run spread on the 2560x6144 shape was up to ~25%, so these are "clearly better than ~40 us", not
++    # fine-tuned optima. A ("off",) entry keeps the current CUTLASS W8A8 path for that shape/bucket.
++    (2560, 6144, 32): ("tile", 16, 32, 256, 4, 3),            # GDN out_proj / attn o_proj   14.3 us
++    (2560, 6144, 64): ("splitk", 32, 256, 2, 4, 3, 64),       # 14.7-20.1 us (tile 19.5-19.9)
++    (16384, 2560, 32): ("tile", 16, 64, 128, 4, 3),           # GDN in_proj_qkvz             29.4 us
++    (16384, 2560, 64): ("splitk", 128, 128, 1, 8, 3, 64),     # 31.9 us (tile 38.8)
++    (13312, 2560, 32): ("tile", 16, 64, 128, 4, 3),           # attention qkv                24.6 us
++    (13312, 2560, 64): ("tile", 64, 128, 128, 8, 3),          # 33.9 us (splitk 33.3)
++    (1280, 2560, 32): ("tile", 16, 32, 256, 4, 3),            # shared-expert gate_up         6.1 us
++    (1280, 2560, 64): ("tile", 16, 32, 256, 4, 3),            #                               6.3 us
++    (2560, 640, 32): ("tile", 16, 32, 256, 4, 3),             # shared-expert down            3.4 us
++    (2560, 640, 64): ("tile", 16, 32, 128, 4, 3),             #                               3.8 us
++}
++
++
++@functools.lru_cache(maxsize=256)
++def plan(M: int, N: int, K: int):
++    mb = m_bucket(M)
++    cfg = TUNED.get((N, K, mb)) or (TUNED.get((N, K, 64)) if mb == 48 else None)
++    if cfg is not None:
++        return cfg
++    # untuned shape: the scratch-free tile family with a generic tile
++    return ("tile", 16, 64, 128, 4, 3)
++
++
++def supported(x, w, scale) -> bool:
++    return (
++        x.dim() == 2 and MIN_M <= x.shape[0] <= MAX_M and x.dtype is torch.bfloat16 and x.stride(1) == 1
++        and w.dim() == 2 and w.dtype is torch.float8_e4m3fn and w.stride(1) == 1 and w.shape[1] == x.shape[1]
++        and scale.dtype is torch.float32 and scale.numel() == w.shape[0] and scale.is_contiguous()
++        and x.device == w.device
++        and plan(x.shape[0], w.shape[0], w.shape[1])[0] != "off"
++    )
++
++
++_SEEN = set()
++
++
++def w8a16_gemv_wide(x, w, scale, cfg=None, out=None, tag="?"):
++    """x [M, K] bf16 (17 <= M <= 64); w fp8 [N, K] K-contiguous; scale fp32 [N] -> bf16 [M, N]."""
++    M, K = x.shape
++    N = w.shape[0]
++    s = scale.reshape(-1)
++    y = out if out is not None else torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
++    if cfg is None:
++        cfg = plan(M, N, K)
++        key = (tag, N, K, M)
++        if key not in _SEEN:
++            _SEEN.add(key)
++            import logging
++
++            logging.getLogger(__name__).info("hillclimb %s wide W8A16: N=%d K=%d M=%d cfg=%s", tag, N, K, M, cfg)
++    if cfg[0] == "tile":
++        _launch_tile(x, w, s, y, cfg)
++    else:
++        _launch_splitk(x, w, s, y, cfg)
++    return y
+diff -ruN a/python/sglang/kernels/ops/gemm/sm120_online_fp8.py b/python/sglang/kernels/ops/gemm/sm120_online_fp8.py
+--- a/python/sglang/kernels/ops/gemm/sm120_online_fp8.py	2026-11-24 16:02:52
++++ b/python/sglang/kernels/ops/gemm/sm120_online_fp8.py	2026-11-24 16:02:51
+@@ -597,6 +597,17 @@
+         from sglang.srt.layers.quantization.w8a16_gemv import w8a16_gemv
+ 
+         return w8a16_gemv(hidden_2d, weight, scale).reshape(*original_shape, columns)
++    # Local patch (2026-11-24, lever I): 17..64 rows (NEXTN verify / draft extend at bs 5..16) through
++    # an M-tiled W8A16 kernel instead of the 32-row kernel (17..32) or the chunked dequant + mm (> 32).
++    import os as _hc_os
++
++    if _hc_os.environ.get("QWEN_I_WIDE_LMHEAD", "0").lower() in ("1", "true", "yes", "on"):
++        from sglang.kernels.ops.gemm import hillclimb_wide_gemm as _hw
++
++        if _hw.supported(hidden_2d, weight, scale):
++            return _hw.w8a16_gemv_wide(hidden_2d, weight, scale, tag="I").reshape(
++                *original_shape, columns
++            )
+     output = torch.empty(
+         (rows, columns), dtype=torch.bfloat16, device=hidden_states.device
+     )
+diff -ruN a/python/sglang/srt/layers/attention/qsa/qsa_indexer.py b/python/sglang/srt/layers/attention/qsa/qsa_indexer.py
+--- a/python/sglang/srt/layers/attention/qsa/qsa_indexer.py	2026-11-24 16:02:52
++++ b/python/sglang/srt/layers/attention/qsa/qsa_indexer.py	2026-11-24 16:02:51
+@@ -40,6 +40,24 @@
+     return min(rows, max_padded_rows)
+ 
+ 
++_MC_TOPK_MAX_ROWS = 64
++_MC_TOPK_LOGGED = set()
++
++
++def _hillclimb_mc_topk() -> bool:
++    import os
++
++    return os.environ.get("QWEN_C_MC_TOPK", "0").lower() in ("1", "true", "yes", "on")
++
++
++def _mc_log_once(rows: int) -> None:
++    if rows not in _MC_TOPK_LOGGED:
++        _MC_TOPK_LOGGED.add(rows)
++        import logging
++
++        logging.getLogger(__name__).info("hillclimb C mc_topk: decode top-512 rows=%d", rows)
++
++
+ class QSAIndexer(MultiPlatformOp):
+     """Config-driven fused-QK, weight-free sparse-attention indexer."""
+ 
+@@ -644,7 +662,26 @@
+             compressed_lengths,
+             max_model_len,
+         )
+-        if logits.is_cuda and self.block_topk == 512:
++        if (
++            logits.is_cuda
++            and self.block_topk == 512
++            and _hillclimb_mc_topk()
++            and logits.dim() == 2
++            and logits.shape[0] <= _MC_TOPK_MAX_ROWS
++            and logits.dtype == torch.float32
++            and logits.stride(1) == 1
++        ):
++            # Local patch (2026-11-24, lever C): multi-CTA exact top-512 (mc_topk.cuh). The
++            # workspace is sized once, outside any capture, for the largest verify batch.
++            from sglang.kernels.ops.elementwise import mc_topk as _mc
++
++            if not torch.cuda.is_current_stream_capturing():
++                _mc.mc_topk_prepare(_MC_TOPK_MAX_ROWS, logits.device)
++            _mc_log_once(logits.shape[0])
++            block_indices = _mc.mc_topk(
++                logits, compressed_lengths.to(torch.int32), self.block_topk
++            )
++        elif logits.is_cuda and self.block_topk == 512:
+             # Decode rows start at zero, so lengths are the compressed lengths
+             # themselves; calling the JIT kernel directly skips the zeros_like
+             # fill + subtract of the generic path.
+diff -ruN a/python/sglang/srt/layers/hc_mix2_triton.py b/python/sglang/srt/layers/hc_mix2_triton.py
+--- a/python/sglang/srt/layers/hc_mix2_triton.py	2026-11-24 16:02:52
++++ b/python/sglang/srt/layers/hc_mix2_triton.py	2026-11-24 16:02:51
+@@ -72,6 +72,18 @@
+ 
+ _HC_MIX2_MAX_ROWS = 16
+ 
++
++def _hillclimb_hc_wide() -> bool:
++    # Local patch (2026-11-24, lever E'): serve 17..64 rows (NEXTN verify at bs 5..16) with the same
++    # three MIX2 kernels, ROWS padded to 32/64 (hillclimb_hc_wide.py). Rows <= 16 are untouched.
++    import os
++
++    return os.environ.get("QWEN_EP_HC_WIDE", "0").lower() in ("1", "true", "yes", "on")
++
++
++def _mix2_max_rows() -> int:
++    return 64 if _hillclimb_hc_wide() else _HC_MIX2_MAX_ROWS
++
+ # Donor FP8 geometry: bench_hc_mix2_fp8.py medians on the HC shapes. K1's wide
+ # n block is what fp8 buys -- the same 2 KB tile spans 64 lowrank columns
+ # instead of 16, so K1 needs a quarter of the CTAs with four k-chunks in flight.
+@@ -363,7 +375,7 @@
+         hyper_input.is_cuda
+         and hyper_input.dim() == 2
+         and hyper_input.dtype == torch.bfloat16
+-        and 1 <= hyper_input.shape[0] <= _HC_MIX2_MAX_ROWS
++        and 1 <= hyper_input.shape[0] <= _mix2_max_rows()
+         and hyper_input.shape[1] == hc * hs
+         and hyper_input.is_contiguous()
+         and hc == _HC_MIX2_HC
+@@ -423,6 +435,12 @@
+             )
+         s_down, s_up = pair
+     device = hyper_input.device
++    if rows > _HC_MIX2_MAX_ROWS:
++        from sglang.srt.layers.hillclimb_hc_wide import hc_norm_mix2_wide
++
++        return hc_norm_mix2_wide(
++            hyper_input, norm_w, eps, w_down, w_up, s_down, s_up, hc=hc, hs=hs, use_pdl=PDL
++        )
+     rows_pad = _HC_MIX2_MAX_ROWS
+ 
+     mixed = torch.empty((rows, hs), dtype=hyper_input.dtype, device=device)
+diff -ruN a/python/sglang/srt/layers/hillclimb_hc_wide.py b/python/sglang/srt/layers/hillclimb_hc_wide.py
+--- a/python/sglang/srt/layers/hillclimb_hc_wide.py	1969-12-31 19:00:00
++++ b/python/sglang/srt/layers/hillclimb_hc_wide.py	2026-11-24 16:02:51
+@@ -0,0 +1,78 @@
++"""Local patch (2026-11-24, lever E', QWEN_EP_HC_WIDE=1): HC MIX2 with FP8 (E4M3, fp32 per-output-row scale) mix weights for 1..64 rows.
++
++Same three Penny kernels (K0 `_hc_branch_stats_kernel`, K1 `_hc_down_kernel`,
++K2 `_hc_up_kernel` from sglang.srt.layers.hc_mix2_triton), same math, same
++weight/scale format as the resident online-FP8 Parameters; only the launcher
++differs: ROWS is padded to 16/32/64 instead of a hard 16-row gate, and the
++launch geometry is picked per ROWS bucket from GEOM (tuned by sweep.py).
++"""
++from __future__ import annotations
++
++import triton
++import torch
++
++from sglang.srt.layers.hc_mix2_triton import (
++    _hc_branch_stats_kernel,
++    _hc_down_kernel,
++    _hc_up_kernel,
++    _STATS_BLOCK,
++    _STATS_WARPS,
++)
++
++MAX_ROWS = 64
++# Geometry per row bucket: key = bucket, ROWS (tl.dot M, >= 16) = max(16, bucket).
++# (down: BLOCK_N, BLOCK_K, BLOCK_G, warps, stages), (up: BLOCK_J, BLOCK_R, warps, stages)
++# Penny's pinned 16-row geometry is DOWN=(64,128,4,8,4) UP=(16,64,4,4).
++# Values from sweep.py (CUDA-graph replay, 64 distinct FP8 weight copies), see
++# sweep_*.json. rows<=16 keeps Penny's pinned geometry: the alternatives
++# (a rows<=4 tile that won the isolated sweep, K2 at 8 warps) were within
++# run-to-run noise or worse end-to-end (ab_small.json).
++GEOM = {
++    16: dict(down=(64, 128, 4, 8, 4), up=(16, 64, 4, 4)),
++    32: dict(down=(64, 128, 4, 4, 4), up=(16, 64, 4, 4)),
++    64: dict(down=(32, 128, 2, 8, 2), up=(16, 32, 8, 4)),
++}
++PENNY_GEOM = dict(down=(64, 128, 4, 8, 4), up=(16, 64, 4, 4))
++
++
++def rows_bucket(rows: int) -> int:
++    return 16 if rows <= 16 else (32 if rows <= 32 else 64)
++
++
++_SEEN = set()
++
++
++def hc_norm_mix2_wide(x, norm_w, eps, w_down, w_up, s_down, s_up, hc=4, hs=2560,
++                      geom=None, use_pdl=False):
++    rows, k = x.shape
++    if rows not in _SEEN:
++        _SEEN.add(rows)
++        import logging
++
++        logging.getLogger(__name__).info("hillclimb E' HC MIX2 wide: rows=%d bucket=%d", rows, rows_bucket(rows))
++    assert 1 <= rows <= MAX_ROWS and k == hc * hs
++    lowrank = w_down.shape[0]
++    bucket = rows_bucket(rows)
++    rp = max(16, bucket)
++    g = geom or GEOM[bucket]
++    bn, bk, bg, dw, ds = g["down"]
++    bj, br, uw, us = g["up"]
++    assert hs % (bk * bg) == 0 and lowrank % bn == 0
++    mixed = torch.empty((rows, hs), dtype=x.dtype, device=x.device)
++    normed = torch.empty_like(x)
++    t_raw = torch.empty((rp, lowrank), dtype=torch.float32, device=x.device)
++    num_tasks, zero_span = rows * hc, rows * lowrank
++    _hc_branch_stats_kernel[(num_tasks,)](
++        x, norm_w, normed, t_raw, num_tasks, zero_span, k, hs, eps,
++        HC=hc, BLOCK_S=_STATS_BLOCK,
++        ZERO_BLOCK=max(64, triton.next_power_of_2(zero_span // num_tasks)),
++        USE_PDL=use_pdl, launch_pdl=use_pdl, num_warps=_STATS_WARPS)
++    _hc_down_kernel[(k // (bk * bg), triton.cdiv(lowrank, bn))](
++        w_down, normed, t_raw, s_down, rows, k, lowrank,
++        ROWS=rp, BLOCK_N=bn, BLOCK_K=bk, BLOCK_G=bg, NUM_STAGES=ds,
++        USE_PDL=use_pdl, launch_pdl=use_pdl, num_warps=dw)
++    _hc_up_kernel[(triton.cdiv(hs, bj),)](
++        normed, w_up, t_raw, mixed, s_up, rows, k, hs, lowrank, 1.0 / hc,
++        ROWS=rp, HC=hc, BLOCK_J=bj, BLOCK_R=br, NUM_STAGES=us,
++        USE_PDL=use_pdl, launch_pdl=use_pdl, num_warps=uw)
++    return mixed, normed
+diff -ruN a/python/sglang/srt/models/qwen4_exp.py b/python/sglang/srt/models/qwen4_exp.py
+--- a/python/sglang/srt/models/qwen4_exp.py	2026-11-24 16:02:51
++++ b/python/sglang/srt/models/qwen4_exp.py	2026-11-24 16:02:51
+@@ -1563,6 +1563,11 @@
+                         )
+ 
+                         prealloc(module.weight.device)
++                        # Local patch (2026-11-24, lever J): the wide kernel's own split-K scratch.
++                        from sglang.kernels.ops.gemm import hillclimb_wide_gemm as _hw
++
++                        if _hw.j_enabled():
++                            _hw.prealloc(module.weight.device)
+                     signature = (
+                         type(module).__name__,
+                         tuple(module.weight.shape),
+@@ -1618,6 +1623,24 @@
+                         )
+ 
+                         y = w8a16_gemv(x, layer.weight.t(), layer.weight_scale)
++                        if bias is not None:
++                            y = y + bias
++                        return y
++                    # Local patch (2026-11-24, lever J): 17..64 rows (NEXTN verify at bs 5..16) through a
++                    # W8A16 kernel instead of CUTLASS W8A8 + per-token activation quant (~40 us fixed).
++                    from sglang.kernels.ops.gemm import hillclimb_wide_gemm as _hw
++
++                    if (
++                        _hw.j_enabled()
++                        and w8a16_gemv_enabled()
++                        and online_fp8_enabled()
++                        and not self.use_marlin
++                        and not self.block_quant
++                        and not self.use_mxfp8
++                        and isinstance(x, torch.Tensor)
++                        and _hw.supported(x, layer.weight.t(), layer.weight_scale)
++                    ):
++                        y = _hw.w8a16_gemv_wide(x, layer.weight.t(), layer.weight_scale, tag="J")
+                         if bias is not None:
+                             y = y + bias
+                         return y

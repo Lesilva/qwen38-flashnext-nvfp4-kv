@@ -1,0 +1,870 @@
+"""QSA indexer for Qwen4-Exp checkpoints."""
+
+from __future__ import annotations
+
+from typing import Tuple
+
+import torch
+
+from sglang.srt.layers.attention.qsa.kernel import (
+    average_pool_qsa_keys,
+    expand_qsa_block_indices,
+    qsa_fast_topk,
+    qsa_prefill_all_visible_indices,
+)
+from sglang.srt.layers.attention.qsa.metadata import (
+    build_group_ring_slots,
+    build_pending_ring_slots,
+    build_rope_position_matrix,
+    pending_ring_groups,
+)
+from sglang.srt.layers.attention.qsa.mqa import qsa_mqa_decode, qsa_mqa_prefill
+from sglang.srt.layers.layernorm import GemmaRMSNorm
+from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
+from sglang.srt.layers.utils import MultiPlatformOp
+
+# Bound the dominant FP32 [query_rows, compressed_keys] prefill workspace.
+# Top-k is row-independent, so large scheduler chunks can be scored in smaller
+# row tiles without changing the selected blocks.
+_QSA_PREFILL_LOGITS_BUDGET_BYTES = 128 * 1024 * 1024
+
+
+def _qsa_prefill_row_chunk_size(rows: int, keys: int, heads: int) -> int:
+    if rows <= 0 or keys <= 0:
+        return max(rows, 1)
+    block_q = max(1, 128 // heads)
+    bytes_per_row = keys * torch.float32.itemsize
+    max_padded_rows = max(block_q, _QSA_PREFILL_LOGITS_BUDGET_BYTES // bytes_per_row)
+    max_padded_rows = max(block_q, max_padded_rows // block_q * block_q)
+    return min(rows, max_padded_rows)
+
+
+_MC_TOPK_MAX_ROWS = 64
+_MC_TOPK_LOGGED = set()
+
+
+def _hillclimb_mc_topk() -> bool:
+    import os
+
+    return os.environ.get("QWEN_C_MC_TOPK", "0").lower() in ("1", "true", "yes", "on")
+
+
+def _mc_log_once(rows: int) -> None:
+    if rows not in _MC_TOPK_LOGGED:
+        _MC_TOPK_LOGGED.add(rows)
+        import logging
+
+        logging.getLogger(__name__).info("hillclimb C mc_topk: decode top-512 rows=%d", rows)
+
+
+class QSAIndexer(MultiPlatformOp):
+    """Config-driven fused-QK, weight-free sparse-attention indexer."""
+
+    def __init__(
+        self,
+        config,
+        layer_id: int,
+        quant_config=None,
+        prefix: str = "",
+        rotary_emb=None,
+    ) -> None:
+        self._validate_config(config)
+        super().__init__()
+        self.layer_id = int(layer_id)
+        self.index_n_heads = int(config.indexer_n_heads)
+        self.index_kv_heads = int(config.indexer_kv_heads)
+        self.index_head_dim = int(config.indexer_head_dim)
+        self.token_topk = int(config.indexer_budget)
+        self.compress_ratio = int(config.indexer_compress_ratio)
+        self.block_topk = self.token_topk // self.compress_ratio
+        if rotary_emb is None:
+            raise ValueError("QSAIndexer must reuse its Qwen4-Exp attention RoPE")
+        self.rotary_emb = rotary_emb
+        if not 0 < self.rotary_emb.rotary_dim <= self.index_head_dim:
+            raise ValueError(
+                "Qwen4-Exp attention RoPE rotary_dim must fit the QSA index head: "
+                f"{self.rotary_emb.rotary_dim=} {self.index_head_dim=}"
+            )
+        self.index_qk_proj = ReplicatedLinear(
+            config.hidden_size,
+            (self.index_n_heads + self.index_kv_heads) * self.index_head_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.index_qk_proj" if prefix else "index_qk_proj",
+        )
+        self.q_layernorm = GemmaRMSNorm(
+            self.index_head_dim, eps=getattr(config, "rms_norm_eps", 1e-6)
+        )
+        self.k_layernorm = GemmaRMSNorm(
+            self.index_head_dim, eps=getattr(config, "rms_norm_eps", 1e-6)
+        )
+        self._rope_axis_map_cache = None
+
+    @staticmethod
+    def _validate_config(config) -> None:
+        names = (
+            "indexer_n_heads",
+            "indexer_kv_heads",
+            "indexer_head_dim",
+            "indexer_budget",
+            "indexer_compress_ratio",
+        )
+        missing = [name for name in names if getattr(config, name, None) is None]
+        if missing:
+            raise ValueError(f"QSA config is missing required fields: {missing}")
+        values = {name: int(getattr(config, name)) for name in names}
+        if any(value <= 0 for value in values.values()):
+            raise ValueError(f"QSA config values must be positive: {values}")
+        if values["indexer_compress_ratio"] < 2:
+            # DP token-padding rows carry logical length 1, which must never
+            # reach a compression boundary; ratio >= 2 guarantees that.
+            raise ValueError(
+                "QSA requires indexer_compress_ratio >= 2, got "
+                f"{values['indexer_compress_ratio']}"
+            )
+        if values["indexer_kv_heads"] != 1:
+            raise ValueError("the QSA MQA operators require indexer_kv_heads=1")
+        if values["indexer_budget"] % values["indexer_compress_ratio"] != 0:
+            raise ValueError(
+                "indexer_budget must be divisible by indexer_compress_ratio"
+            )
+        block_topk = values["indexer_budget"] // values["indexer_compress_ratio"]
+        if block_topk not in (512, 2048):
+            raise ValueError(
+                "fast_topk_v2 requires indexer_budget / indexer_compress_ratio "
+                f"to be 512 or 2048, got {block_topk}"
+            )
+
+    def _use_fused_prep(self, tensor: torch.Tensor) -> bool:
+        """Whether the fused indexer-prep kernels support this configuration."""
+        return (
+            tensor.is_cuda
+            and tensor.dtype in (torch.bfloat16, torch.float16)
+            and self.index_head_dim in (64, 128, 256)
+            and self.rotary_emb.rotary_dim % 2 == 0
+            and not getattr(self.rotary_emb, "mrope_interleaved_glm", False)
+            and len(getattr(self.rotary_emb, "mrope_section", None) or ()) in (0, 3)
+            and getattr(self.rotary_emb, "cos_sin_cache", None) is not None
+            and self.rotary_emb.cos_sin_cache.is_cuda
+            and self.rotary_emb.cos_sin_cache.dtype == torch.float32
+        )
+
+    def _rope_axis_map(self, device) -> torch.Tensor:
+        """Per-pair position-axis selector reproducing the MRoPE composition.
+
+        Pair index i reads cos/sin of position axis ``axis_map[i]``: all zero
+        for plain RoPE; Qwen interleaved MRoPE takes axes 1/2 at pair indices
+        1/2 mod 3 within their sections; sectioned MRoPE maps section ranges.
+        """
+        cache = self._rope_axis_map_cache
+        if cache is not None and cache.device == device:
+            return cache
+        half = self.rotary_emb.rotary_dim // 2
+        section = getattr(self.rotary_emb, "mrope_section", None) or None
+        axis_map = torch.zeros(half, dtype=torch.int32)
+        if section is not None:
+            s0, s1, s2 = (int(v) for v in section)
+            if getattr(self.rotary_emb, "mrope_interleaved", False):
+                pair = torch.arange(half, dtype=torch.int32)
+                axis_map[((pair % 3) == 1) & (pair < s1 * 3)] = 1
+                axis_map[((pair % 3) == 2) & (pair < s2 * 3)] = 2
+            else:
+                axis_map[s0 : s0 + s1] = 1
+                axis_map[s0 + s1 :] = 2
+        self._rope_axis_map_cache = axis_map.to(device)
+        return self._rope_axis_map_cache
+
+    def project_qk(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        pool=None,
+        cache_loc: torch.Tensor | None = None,
+        q_heads_padded: int | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, bool]:
+        qk, _ = self.index_qk_proj(hidden_states)
+        token_k = qk[:, self.index_n_heads * self.index_head_dim :].reshape(
+            -1, self.index_kv_heads, self.index_head_dim
+        )
+        if (
+            pool is not None
+            and cache_loc is not None
+            and qk.shape[0] > 0
+            and self._use_fused_prep(qk)
+        ):
+            from sglang.kernels.ops.attention.qsa_indexer import (
+                qsa_index_q_norm_rope_store,
+            )
+
+            # ModelRunner expands every RoPE cache to the serving context
+            # bound after loading and before any graph capture. Reading the
+            # maximum position back to the host here serializes every QSA layer.
+            key_state_buffer = pool.get_qsa_key_state_buffer(self.layer_id)
+            q = qsa_index_q_norm_rope_store(
+                qk,
+                positions.long(),
+                self.rotary_emb.cos_sin_cache,
+                self._rope_axis_map(qk.device),
+                self.q_layernorm.weight.data,
+                cache_loc[: qk.shape[0]].long(),
+                key_state_buffer.view(key_state_buffer.shape[0], -1),
+                pool.qsa_rope_position_buffer,
+                self.index_n_heads,
+                self.rotary_emb.rotary_dim,
+                self.q_layernorm.variance_epsilon,
+                self.rotary_emb.is_neox_style,
+                q_heads_padded=q_heads_padded,
+            )
+            return q, token_k, True
+        q_raw = qk[:, : self.index_n_heads * self.index_head_dim]
+        q = self.q_layernorm(q_raw.reshape(-1, self.index_head_dim)).reshape(
+            -1, self.index_n_heads, self.index_head_dim
+        )
+        q = self.apply_rope(positions, q)
+        return q, token_k, False
+
+    def normalize_compressed_keys(
+        self, compressed_keys: torch.Tensor, block_positions: torch.Tensor
+    ) -> torch.Tensor:
+        normalized = self.k_layernorm(
+            compressed_keys.reshape(-1, self.index_head_dim)
+        ).reshape(-1, self.index_kv_heads, self.index_head_dim)
+        return self.apply_rope(block_positions, normalized)
+
+    def _use_fused_compress(self, pool) -> bool:
+        return getattr(
+            pool, "qsa_rope_position_buffer", None
+        ) is not None and self._use_fused_prep(
+            pool.get_qsa_key_state_buffer(self.layer_id)
+        )
+
+    def _fused_compress_store(
+        self,
+        pool,
+        group_locs: torch.Tensor,
+        write_locs: torch.Tensor,
+        source_keys: torch.Tensor | None = None,
+        source_rope: torch.Tensor | None = None,
+    ) -> None:
+        """Fused mean -> gemma norm -> MRoPE -> compressed-cache store.
+
+        The member source defaults to the pending ring; extend forwards pass
+        this forward's packed keys/rope instead (members are chunk-local).
+        """
+        from sglang.kernels.ops.attention.qsa_indexer import (
+            qsa_index_k_compress_store,
+        )
+
+        if source_keys is None:
+            source_keys = pool.get_qsa_key_state_buffer(self.layer_id)
+        if source_rope is None:
+            source_rope = pool.qsa_rope_position_buffer
+        compressed_buffer = pool.get_qsa_compressed_k_buffer(self.layer_id)
+        qsa_index_k_compress_store(
+            source_keys.reshape(source_keys.shape[0], -1)
+            .contiguous()
+            .to(pool.index_state_dtype),
+            group_locs.to(torch.int32),
+            source_rope,
+            self.rotary_emb.cos_sin_cache,
+            self._rope_axis_map(source_keys.device),
+            self.k_layernorm.weight.data,
+            write_locs.to(torch.int32),
+            compressed_buffer.view(compressed_buffer.shape[0], -1),
+            self.compress_ratio,
+            self.rotary_emb.rotary_dim,
+            self.k_layernorm.variance_epsilon,
+            self.rotary_emb.is_neox_style,
+        )
+
+    def _pending_ring_slots(
+        self, metadata, logical_positions: torch.Tensor, is_extend: bool
+    ) -> torch.Tensor:
+        return build_pending_ring_slots(
+            token_to_batch_idx=metadata.token_to_batch_idx,
+            req_pool_indices=metadata.req_pool_indices,
+            sequence_lengths=metadata.sequence_lengths,
+            logical_positions=logical_positions,
+            compress_ratio=self.compress_ratio,
+            is_extend=is_extend,
+            num_groups=pending_ring_groups(metadata.token_to_kv_pool),
+        )
+
+    def _group_ring_slots(
+        self, metadata, group_end_positions: torch.Tensor, sequence_ids: torch.Tensor
+    ) -> torch.Tensor:
+        return build_group_ring_slots(
+            req_pool_indices=metadata.req_pool_indices,
+            group_end_positions=group_end_positions,
+            sequence_ids=sequence_ids,
+            compress_ratio=self.compress_ratio,
+            num_groups=pending_ring_groups(metadata.token_to_kv_pool),
+        )
+
+    def update_key_state_and_compress(
+        self,
+        token_k: torch.Tensor,
+        logical_positions: torch.Tensor,
+        rope_positions: torch.Tensor,
+        metadata,
+        state_slots: torch.Tensor | None = None,
+        state_stored: bool = False,
+    ) -> None:
+        """Store the pending-group ring and compress each completed group."""
+
+        pool = metadata.token_to_kv_pool
+        is_extend = metadata.compress_member_rows is not None
+        has_cross_prefix_group = is_extend and getattr(
+            metadata, "has_cross_prefix_group", False
+        )
+        if has_cross_prefix_group:
+            if state_stored:
+                raise RuntimeError(
+                    "QSA cross-prefix compression must read the old pending "
+                    "ring before fused preparation updates it"
+                )
+            # A later pending tail in this same chunk can wrap the request
+            # ring and overwrite a prefix member. Consume crossed groups
+            # before publishing any of this forward's new pending state.
+            self._compress_cross_prefix_groups(token_k, metadata)
+        if not state_stored:
+            if state_slots is None:
+                state_slots = self._pending_ring_slots(
+                    metadata, logical_positions, is_extend
+                )
+            pool.set_qsa_key_state_buffer(
+                self.layer_id, state_slots[: token_k.shape[0]], token_k
+            )
+            pool.set_qsa_rope_position_buffer(
+                state_slots[: token_k.shape[0]], rope_positions
+            )
+
+        if metadata.is_cuda_graph:
+            self._compress_decode_cuda_graph(metadata)
+            return
+
+        if metadata.write_locs is None:
+            raise RuntimeError(
+                "QSA metadata is missing the precomputed write plan; the "
+                "sparse-attention backend derives it from the batch lengths"
+            )
+        if metadata.write_locs.numel() == 0:
+            return
+        group_end_positions = metadata.compress_group_positions.long()
+        compressed_locs = metadata.write_locs
+        if is_extend:
+            member_rows = metadata.compress_member_rows.long()
+            group_locs = member_rows[:, None] + torch.arange(
+                self.compress_ratio, device=member_rows.device, dtype=torch.long
+            )
+            prefix_members = getattr(metadata, "compress_prefix_members", None)
+            if prefix_members is not None:
+                prefix_members = prefix_members.long()
+                first_current_rows = member_rows + prefix_members
+                group_locs = torch.maximum(group_locs, first_current_rows[:, None])
+                # Crossed groups were written from the old ring before its
+                # update above. Route this ordinary packed-key pass to the
+                # inert slot so it cannot replace the correct result.
+                compressed_locs = torch.where(
+                    prefix_members > 0,
+                    torch.zeros_like(compressed_locs),
+                    compressed_locs,
+                )
+            plan_valid = metadata.compress_plan_valid
+            if plan_valid is not None:
+                # Only dummy plan entries may alias row zero. Clamping all
+                # reads would also hide a malformed real group; preserve its
+                # invalid address for the eager/fused path to report.
+                group_locs = torch.where(
+                    plan_valid[:, None], group_locs, member_rows[:, None]
+                )
+            source_keys = token_k
+            source_rope = metadata.extend_rope_matrix
+            if source_rope is None:
+                source_rope = build_rope_position_matrix(
+                    rope_positions, token_k.shape[0]
+                )
+        else:
+            # Paged eager rows (speculative fallback) complete at most one
+            # group each; its members are exactly the pending ring window.
+            group_locs = metadata.compress_group_ring_locs
+            if group_locs is None:
+                group_locs = self._group_ring_slots(
+                    metadata,
+                    group_end_positions,
+                    metadata.compress_sequence_ids.long(),
+                )
+            source_keys = pool.get_qsa_key_state_buffer(self.layer_id)
+            source_rope = pool.qsa_rope_position_buffer
+        if self._use_fused_compress(pool):
+            self._fused_compress_store(
+                pool,
+                group_locs,
+                compressed_locs,
+                source_keys=source_keys,
+                source_rope=source_rope,
+            )
+            return
+        key_groups = source_keys[group_locs]
+        pooled = average_pool_qsa_keys(key_groups)
+        compressed_rope_positions = self._rope_from_matrix(
+            source_rope[group_locs[:, 0]]
+        )
+        normalized = self.normalize_compressed_keys(pooled, compressed_rope_positions)
+        pool.set_qsa_compressed_k_buffer(self.layer_id, compressed_locs, normalized)
+
+    def _compress_cross_prefix_groups(self, token_k: torch.Tensor, metadata) -> None:
+        """Rebuild groups split between the retained ring and this extend.
+
+        This runs before the new chunk updates the modulo-addressed ring. A
+        long chunk may itself leave a pending tail whose writes alias the old
+        prefix slots, so reversing this order silently mixes different groups.
+        """
+
+        prefix_members = metadata.compress_prefix_members
+        ring_group_locs = metadata.compress_group_ring_locs
+        prefix_rope_positions = metadata.cross_prefix_rope_positions
+        if (
+            prefix_members is None
+            or ring_group_locs is None
+            or prefix_rope_positions is None
+        ):
+            raise RuntimeError("QSA cross-prefix compression metadata is incomplete")
+
+        prefix_members = prefix_members.long()
+        plan_valid = metadata.compress_plan_valid
+        cross = prefix_members > 0
+        if plan_valid is not None:
+            cross = cross & plan_valid
+
+        member_rows = metadata.compress_member_rows.long()
+        current_group_locs = member_rows[:, None] + torch.arange(
+            self.compress_ratio, device=member_rows.device, dtype=torch.long
+        )
+        first_current_rows = member_rows + prefix_members
+        current_group_locs = torch.maximum(
+            current_group_locs, first_current_rows[:, None]
+        )
+        if plan_valid is not None:
+            current_group_locs = torch.where(
+                plan_valid[:, None],
+                current_group_locs,
+                first_current_rows[:, None],
+            )
+        ring_group_locs = ring_group_locs.long()
+
+        pool = metadata.token_to_kv_pool
+        current_keys = token_k[current_group_locs]
+        ring_keys = pool.get_qsa_key_state_buffer(self.layer_id)[ring_group_locs]
+        use_ring = (
+            torch.arange(
+                self.compress_ratio,
+                device=prefix_members.device,
+                dtype=torch.long,
+            )[None, :]
+            < prefix_members[:, None]
+        )
+        while use_ring.ndim < current_keys.ndim:
+            use_ring = use_ring.unsqueeze(-1)
+        key_groups = torch.where(use_ring, ring_keys, current_keys)
+        pooled = average_pool_qsa_keys(key_groups)
+        compressed_rope_positions = self._rope_from_matrix(prefix_rope_positions)
+        normalized = self.normalize_compressed_keys(pooled, compressed_rope_positions)
+        # Keep the plan fixed-capacity and device-asynchronous: non-crossing
+        # and padded rows write the reserved dump slot instead of boolean-
+        # compacting a device mask (which would need a dynamic output size).
+        cross_write_locs = torch.where(
+            cross, metadata.write_locs, torch.zeros_like(metadata.write_locs)
+        )
+        pool.set_qsa_compressed_k_buffer(self.layer_id, cross_write_locs, normalized)
+
+    def _compress_decode_cuda_graph(self, metadata) -> None:
+        """Run a fixed-shape compression step; non-boundaries write slot zero.
+
+        Member slots come from ``metadata.graph_ring_group_locs``, a static
+        buffer refreshed before every replay alongside the other graph
+        buffers (triton prologue, or the host fallback refresh).
+        """
+
+        if metadata.graph_write_locs is None or metadata.graph_ring_group_locs is None:
+            raise RuntimeError("QSA CUDA graph compression metadata is incomplete")
+        pool = metadata.token_to_kv_pool
+        group_locs = metadata.graph_ring_group_locs
+        if self._use_fused_compress(pool):
+            self._fused_compress_store(
+                pool,
+                group_locs,
+                metadata.graph_write_locs,
+            )
+            return
+        key_groups = pool.get_qsa_key_state_buffer(self.layer_id)[group_locs]
+        compressed = average_pool_qsa_keys(key_groups)
+        compressed_rope_positions = self._rope_from_matrix(
+            pool.qsa_rope_position_buffer[group_locs[:, 0]]
+        )
+        compressed = self.normalize_compressed_keys(
+            compressed, compressed_rope_positions
+        )
+        pool.set_qsa_compressed_k_buffer(
+            self.layer_id, metadata.graph_write_locs, compressed.contiguous()
+        )
+
+    def _rope_from_matrix(self, positions: torch.Tensor) -> torch.Tensor:
+        """[n, 3] slot coordinates -> the layout apply_rope expects."""
+        positions = positions.transpose(0, 1)
+        if not getattr(self.rotary_emb, "mrope_section", None):
+            return positions[0]
+        return positions
+
+    def apply_rope(self, positions: torch.Tensor, tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.numel() == 0:
+            return tensor
+        positions = positions.long()
+        num_positions = (
+            positions.shape[-1] if positions.ndim == 2 else positions.numel()
+        )
+        if num_positions != tensor.shape[0]:
+            raise ValueError("QSA RoPE positions must match the token dimension")
+        # RoPE capacity is reserved once by ModelRunner after model loading.
+        # Keep this per-layer path device-asynchronous.
+
+        # Let the exact Qwen4-Exp RoPE instance compose regular or three-axis
+        # multimodal positions.  Its public cache view repeats cos/sin to the
+        # full rotary width; apply_rotary_emb consumes one half.
+        self.rotary_emb.get_cos_sin_with_position(positions)
+        rotary_dim = self.rotary_emb.rotary_dim
+        half_rotary_dim = rotary_dim // 2
+        cos = self.rotary_emb.position_cos.reshape(num_positions, -1)[
+            :, :half_rotary_dim
+        ]
+        sin = self.rotary_emb.position_sin.reshape(num_positions, -1)[
+            :, :half_rotary_dim
+        ]
+        rotated = apply_rotary_emb(
+            tensor[..., :rotary_dim],
+            cos,
+            sin,
+            self.rotary_emb.is_neox_style,
+        )
+        return torch.cat([rotated, tensor[..., rotary_dim:]], dim=-1)
+
+    def select_prefill_all_visible_tokens(
+        self,
+        query_positions: torch.Tensor,
+        token_to_batch_idx: torch.Tensor,
+        sequence_lengths: torch.Tensor,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        return qsa_prefill_all_visible_indices(
+            query_positions,
+            token_to_batch_idx,
+            sequence_lengths,
+            output,
+            self.token_topk,
+            self.compress_ratio,
+        )
+
+    def select_prefill_tokens(
+        self,
+        q: torch.Tensor,
+        compressed_keys: torch.Tensor,
+        row_starts: torch.Tensor,
+        row_ends: torch.Tensor,
+        query_positions: torch.Tensor,
+        sequence_lengths_for_rows: torch.Tensor,
+        stall_diagnostics=None,
+    ) -> torch.Tensor:
+        rows = q.shape[0]
+        output = torch.empty(
+            (rows, self.token_topk + self.compress_ratio - 1),
+            dtype=torch.int32,
+            device=q.device,
+        )
+        if rows == 0:
+            return output
+
+        row_chunk_size = _qsa_prefill_row_chunk_size(
+            rows, compressed_keys.shape[0], q.shape[1]
+        )
+        for row_start in range(0, rows, row_chunk_size):
+            row_end = min(row_start + row_chunk_size, rows)
+            chunk_slice = slice(row_start, row_end)
+            if compressed_keys.shape[0] == 0:
+                block_indices = torch.full(
+                    (row_end - row_start, self.block_topk),
+                    -1,
+                    dtype=torch.int32,
+                    device=q.device,
+                )
+                logits = None
+            else:
+                if stall_diagnostics is not None:
+                    stall_diagnostics.set_phase(
+                        self.layer_id, f"scoring_rows[{row_start}:{row_end}]"
+                    )
+                logits = qsa_mqa_prefill(
+                    q[chunk_slice],
+                    compressed_keys,
+                    row_starts[chunk_slice],
+                    row_ends[chunk_slice],
+                )
+                if stall_diagnostics is not None:
+                    stall_diagnostics.mark_stage(
+                        self.layer_id, f"scores_ready[{row_start}:{row_end}]"
+                    )
+                    stall_diagnostics.set_phase(
+                        self.layer_id, f"topk_rows[{row_start}:{row_end}]"
+                    )
+                block_indices = qsa_fast_topk(
+                    logits,
+                    row_starts[chunk_slice],
+                    row_ends[chunk_slice],
+                    topk=self.block_topk,
+                )
+                if stall_diagnostics is not None:
+                    stall_diagnostics.mark_stage(
+                        self.layer_id, f"topk_ready[{row_start}:{row_end}]"
+                    )
+            if stall_diagnostics is not None:
+                stall_diagnostics.set_phase(
+                    self.layer_id, f"expanding_rows[{row_start}:{row_end}]"
+                )
+            selected = expand_qsa_block_indices(
+                block_indices,
+                query_positions[chunk_slice],
+                sequence_lengths_for_rows[chunk_slice],
+                compress_ratio=self.compress_ratio,
+                token_topk=self.token_topk,
+            )
+            output[chunk_slice].copy_(selected)
+            if stall_diagnostics is not None:
+                stall_diagnostics.mark_stage(
+                    self.layer_id, f"expanded_rows_ready[{row_start}:{row_end}]"
+                )
+            del logits, block_indices, selected
+        return output
+
+    def select_decode_tokens(
+        self,
+        q: torch.Tensor,
+        compressed_cache: torch.Tensor,
+        compressed_page_table: torch.Tensor,
+        compressed_lengths: torch.Tensor,
+        max_model_len: int,
+        query_positions: torch.Tensor,
+        sequence_lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        logits = qsa_mqa_decode(
+            q,
+            compressed_cache,
+            compressed_page_table,
+            compressed_lengths,
+            max_model_len,
+        )
+        if (
+            logits.is_cuda
+            and self.block_topk == 512
+            and _hillclimb_mc_topk()
+            and logits.dim() == 2
+            and logits.shape[0] <= _MC_TOPK_MAX_ROWS
+            and logits.dtype == torch.float32
+            and logits.stride(1) == 1
+        ):
+            # Local patch (2026-11-24, lever C): multi-CTA exact top-512 (mc_topk.cuh). The
+            # workspace is sized once, outside any capture, for the largest verify batch.
+            from sglang.kernels.ops.elementwise import mc_topk as _mc
+
+            if not torch.cuda.is_current_stream_capturing():
+                _mc.mc_topk_prepare(_MC_TOPK_MAX_ROWS, logits.device)
+            _mc_log_once(logits.shape[0])
+            block_indices = _mc.mc_topk(
+                logits, compressed_lengths.to(torch.int32), self.block_topk
+            )
+        elif logits.is_cuda and self.block_topk == 512:
+            # Decode rows start at zero, so lengths are the compressed lengths
+            # themselves; calling the JIT kernel directly skips the zeros_like
+            # fill + subtract of the generic path.
+            from sglang.kernels.ops.elementwise.fast_topk import fast_topk
+
+            block_indices = fast_topk(
+                logits,
+                compressed_lengths.to(torch.int32),
+                topk=self.block_topk,
+                row_starts=None,
+            )
+        else:
+            row_starts = torch.zeros_like(compressed_lengths, dtype=torch.int32)
+            block_indices = qsa_fast_topk(
+                logits, row_starts, compressed_lengths, topk=self.block_topk
+            )
+        return expand_qsa_block_indices(
+            block_indices,
+            query_positions,
+            sequence_lengths,
+            compress_ratio=self.compress_ratio,
+            token_topk=self.token_topk,
+        )
+
+    def forward_cuda(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch,
+        indexer_metadata,
+        stall_diagnostics=None,
+    ) -> torch.Tensor:
+        # Only the model's active prefix-bearing diagnostic span supplies this
+        # argument. Never insert event work into paged/graph execution.
+        if getattr(indexer_metadata, "is_cuda_graph", False):
+            stall_diagnostics = None
+        forward_mode = forward_batch.forward_mode
+        is_target_verify = getattr(forward_mode, "is_target_verify", lambda: False)()
+        is_draft_extend = getattr(forward_mode, "is_draft_extend_v2", lambda: False)()
+        if forward_mode.is_decode() or is_target_verify or is_draft_extend:
+            stall_diagnostics = None
+        if forward_mode.is_decode() or is_target_verify or is_draft_extend:
+            # EAGLE/MTP may advance the model's RoPE coordinate independently
+            # from the physical paged-KV position.  Compression and sparse
+            # selection must use the latter; otherwise a draft step can index
+            # token_slot_table[:, seq_len] one past the valid range.
+            logical_positions = indexer_metadata.decode_logical_positions
+            if logical_positions is None:
+                logical_positions = indexer_metadata.get_seqlens_expanded() - 1
+        else:
+            logical_positions = getattr(forward_batch, "positions", None)
+            if logical_positions is None:
+                logical_positions = positions[0] if positions.ndim == 2 else positions
+            logical_positions = logical_positions.flatten()
+        # DP MAX_LEN padding adds token rows without assigning them to a
+        # request. token_to_batch_idx is the source of truth for semantic rows.
+        num_valid_tokens = indexer_metadata.get_token_to_batch_idx().numel()
+        if logical_positions.numel() < num_valid_tokens:
+            raise ValueError(
+                "QSA logical positions are shorter than the request mapping: "
+                f"positions={logical_positions.numel()}, mapping={num_valid_tokens}"
+            )
+        if hidden_states.shape[0] < num_valid_tokens:
+            raise ValueError(
+                "QSA hidden states are shorter than the request mapping: "
+                f"hidden={hidden_states.shape[0]}, mapping={num_valid_tokens}"
+            )
+        position_tokens = (
+            positions.shape[-1] if positions.ndim == 2 else positions.numel()
+        )
+        if position_tokens < num_valid_tokens:
+            raise ValueError(
+                "QSA RoPE positions are shorter than the request mapping: "
+                f"positions={position_tokens}, mapping={num_valid_tokens}"
+            )
+
+        logical_positions = logical_positions[:num_valid_tokens]
+        hidden_states = hidden_states[:num_valid_tokens]
+        positions = (
+            positions[:, :num_valid_tokens]
+            if positions.ndim == 2
+            else positions[:num_valid_tokens]
+        )
+        state_slots = indexer_metadata.pending_ring_slots
+        if state_slots is None:
+            state_slots = self._pending_ring_slots(
+                indexer_metadata,
+                logical_positions,
+                indexer_metadata.compress_member_rows is not None,
+            )
+        # Cross-prefix groups must consume the previous ring generation before
+        # this chunk publishes its tail. Fused preparation stores as part of
+        # projection, so bypass it only for this rare unaligned EXTEND case;
+        # aligned extend and all paged/MTP paths keep the existing fast path.
+        preserve_prefix_ring = (
+            indexer_metadata.compress_member_rows is not None
+            and getattr(indexer_metadata, "has_cross_prefix_group", False)
+        )
+        if stall_diagnostics is not None:
+            stall_diagnostics.set_phase(self.layer_id, "index_qk_projection_and_prep")
+        q, token_k, state_stored = self.project_qk(
+            hidden_states,
+            positions,
+            pool=(None if preserve_prefix_ring else indexer_metadata.token_to_kv_pool),
+            cache_loc=(None if preserve_prefix_ring else state_slots),
+            q_heads_padded=(
+                # The tilelang decode MQA requires a query-head multiple of 8;
+                # writing the zero padding from the fused prep kernel avoids a
+                # separate fill + cat per layer.
+                ((self.index_n_heads + 7) // 8) * 8
+                if (forward_mode.is_decode() or is_target_verify or is_draft_extend)
+                else None
+            ),
+        )
+        if stall_diagnostics is not None:
+            stall_diagnostics.mark_stage(self.layer_id, "index_qk_prepared")
+            stall_diagnostics.set_phase(self.layer_id, "key_update_and_compress")
+        self.update_key_state_and_compress(
+            token_k,
+            logical_positions,
+            positions,
+            indexer_metadata,
+            state_slots=state_slots,
+            state_stored=state_stored,
+        )
+        if stall_diagnostics is not None:
+            stall_diagnostics.mark_stage(self.layer_id, "compressed_keys_updated")
+        if forward_mode.is_decode() or is_target_verify or is_draft_extend:
+            compressed_cache, page_table, compressed_lengths, max_model_len = (
+                indexer_metadata.get_decode_mqa_inputs(self.layer_id)
+            )
+            return self.select_decode_tokens(
+                q,
+                compressed_cache,
+                page_table,
+                compressed_lengths,
+                max_model_len,
+                logical_positions,
+                indexer_metadata.get_seqlens_int32(),
+            )
+
+        if getattr(indexer_metadata, "prefill_all_visible", False):
+            # fast_topk explicitly leaves result order unspecified. Sparse
+            # attention consumes the selected set, so the ascending canonical
+            # range is a valid representation when every visible token wins.
+            output = indexer_metadata.prefill_all_visible_scratch
+            if output is None:
+                raise RuntimeError(
+                    "QSA all-visible prefill scratch was not initialized"
+                )
+            return self.select_prefill_all_visible_tokens(
+                logical_positions,
+                indexer_metadata.get_token_to_batch_idx(),
+                indexer_metadata.get_seqlens_int32(),
+                output,
+            )
+
+        if stall_diagnostics is not None:
+            stall_diagnostics.set_phase(self.layer_id, "gathering_prefill_inputs")
+        compressed_keys, row_starts, row_ends, sequence_lengths = (
+            indexer_metadata.get_prefill_mqa_inputs(self.layer_id, logical_positions)
+        )
+        query_sequence_ids = indexer_metadata.get_token_to_batch_idx()
+        row_sequence_lengths = sequence_lengths.index_select(
+            0, query_sequence_ids.long()
+        )
+        if stall_diagnostics is not None:
+            stall_diagnostics.mark_stage(self.layer_id, "prefill_inputs_ready")
+        return self.select_prefill_tokens(
+            q,
+            compressed_keys,
+            row_starts,
+            row_ends,
+            logical_positions,
+            row_sequence_lengths,
+            **(
+                {"stall_diagnostics": stall_diagnostics}
+                if stall_diagnostics is not None
+                else {}
+            ),
+        )
+
+
+__all__ = [
+    "QSAIndexer",
+]
